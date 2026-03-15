@@ -184,6 +184,7 @@ func runUpgrade(args []string) {
 	if usingBrew {
 		fmt.Println("  Detected Homebrew install.")
 		fmt.Println("  This will run: brew upgrade scrypster/tap/muninn")
+		fmt.Println("  The daemon will be stopped before upgrading and restarted after.")
 	} else {
 		fmt.Println("  Your data is safe. Only the binary will be replaced.")
 		fmt.Println("  The daemon will restart automatically.")
@@ -208,9 +209,36 @@ func runUpgrade(args []string) {
 		}
 	}
 
-	// Homebrew: delegate to brew
+	// Homebrew: stop daemon → brew upgrade → restart daemon
 	if usingBrew {
 		fmt.Println()
+
+		daemonWasRunning := isDaemonRunning()
+
+		if daemonWasRunning {
+			fmt.Printf("  %-28s", "Stopping daemon...")
+			pidPath := filepath.Join(defaultDataDir(), "muninn.pid")
+			if pid, err := readPID(pidPath); err == nil {
+				if proc, err := os.FindProcess(pid); err == nil {
+					_ = stopProcess(proc)
+					deadline := time.Now().Add(15 * time.Second)
+					for time.Now().Before(deadline) {
+						if !isProcessRunning(pid) {
+							break
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+					if isProcessRunning(pid) {
+						_ = proc.Kill()
+						time.Sleep(500 * time.Millisecond)
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+			}
+			os.Remove(pidPath)
+			fmt.Println(" ✓")
+		}
+
 		fmt.Println("  Running brew upgrade...")
 		fmt.Println()
 		cmd := exec.Command("brew", "upgrade", "scrypster/tap/muninn")
@@ -221,6 +249,21 @@ func runUpgrade(args []string) {
 			fmt.Fprintf(os.Stderr, "  brew upgrade failed: %v\n", err)
 			osExit(1)
 		}
+
+		if daemonWasRunning {
+			fmt.Println()
+			fmt.Printf("  %-28s", "Restarting daemon...")
+			if err := runStart(true); err != nil {
+				fmt.Println(" ✗")
+				fmt.Fprintf(os.Stderr, "  Failed to restart daemon: %v\n", err)
+				osExit(1)
+			}
+			fmt.Println(" ✓")
+			fmt.Println()
+			fmt.Printf("  Web UI → http://127.0.0.1:8476\n")
+			fmt.Println()
+		}
+
 		return
 	}
 
@@ -446,14 +489,22 @@ func selfUpdate(latest string) error {
 		if err := stopProcess(proc); err != nil {
 			return fmt.Errorf("stop daemon: %w", err)
 		}
-		// Wait up to 3s for process to exit
-		deadline := time.Now().Add(3 * time.Second)
+		// Wait up to 15s for graceful exit (PebbleDB flush + WAL sync can take several seconds).
+		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
 			if !isProcessRunning(pid) {
 				break
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+		// If still alive after graceful period, force-kill to unblock the upgrade.
+		if isProcessRunning(pid) {
+			_ = proc.Kill()
+			time.Sleep(500 * time.Millisecond)
+		}
+		// Brief grace period for the OS to release file locks (e.g. PebbleDB LOCK file)
+		// before the new binary attempts to open the same data directory.
+		time.Sleep(200 * time.Millisecond)
 		os.Remove(pidPath)
 		return nil
 	}); err != nil {
@@ -496,9 +547,13 @@ func selfUpdate(latest string) error {
 	// Restart daemon if it was running before
 	if daemonWasRunning {
 		fmt.Printf("  %-28s", "Restarting daemon...")
-		runStart(true) // manages its own output and error handling
+		if err := runStart(true); err != nil {
+			fmt.Println(" ✗")
+			return fmt.Errorf("restart failed: %w", err)
+		}
 		fmt.Println(" ✓")
 	}
 
 	return nil
 }
+

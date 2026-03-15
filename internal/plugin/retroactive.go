@@ -2,10 +2,14 @@ package plugin
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/cockroachdb/pebble"
 )
 
 // pollInterval is how often the processor checks for newly written, unembedded engrams.
@@ -19,6 +23,12 @@ const maxBatchSize = 1000
 // maxBackoff is the upper bound for exponential back-off when the store
 // returns persistent errors on CountWithoutFlag / ScanWithoutFlag.
 const maxBackoff = 5 * time.Minute
+
+// maxIdleInterval is the upper bound for poll back-off when CountWithoutFlag
+// reports pending items but the scan produces no actual work (phantom count).
+// The processor resets to pollInterval as soon as real work is done or Notify()
+// is called.
+const maxIdleInterval = 3 * time.Minute
 
 // RetroactiveProcessor processes engrams asynchronously with a registered plugin.
 // It scans for engrams missing a digest flag and calls the plugin to process them.
@@ -83,6 +93,11 @@ func (rp *RetroactiveProcessor) Stats() RetroactiveStats {
 	return rp.stats
 }
 
+// Plugin returns the plugin associated with this processor.
+func (p *RetroactiveProcessor) Plugin() Plugin {
+	return p.plugin
+}
+
 // Mode returns "embed" when this processor handles embedding (DigestEmbed flag)
 // or "enrich" when it handles enrichment (DigestEnrich flag).
 func (rp *RetroactiveProcessor) Mode() string {
@@ -90,6 +105,15 @@ func (rp *RetroactiveProcessor) Mode() string {
 		return "embed"
 	}
 	return "enrich"
+}
+
+// skipFlags returns the digest flags that should be excluded from scanning.
+// Embed processors skip DigestEmbedFailed engrams to avoid infinite retry loops.
+func (rp *RetroactiveProcessor) skipFlags() uint8 {
+	if rp.flagBit == DigestEmbed {
+		return DigestEmbedFailed
+	}
+	return 0
 }
 
 func (rp *RetroactiveProcessor) run(ctx context.Context) {
@@ -105,6 +129,7 @@ func (rp *RetroactiveProcessor) run(ctx context.Context) {
 	defer ticker.Stop()
 
 	var consecutiveErrors int
+	var consecutiveIdle int
 
 	// Initial pass immediately on start.
 	if rp.processBatch(ctx) {
@@ -121,21 +146,55 @@ func (rp *RetroactiveProcessor) run(ctx context.Context) {
 			rp.statsMu.Unlock()
 			return
 		case <-rp.notifyCh:
-			if rp.processBatch(ctx) {
+			// Explicit wakeup (new engram written) — always run immediately.
+			if rp.processBatchIdle(ctx, &consecutiveIdle) {
 				consecutiveErrors = 0
 			} else {
 				consecutiveErrors++
 				rp.backoff(ctx, consecutiveErrors)
 			}
+			// Reset to fast polling on explicit notify.
+			if consecutiveIdle == 0 {
+				ticker.Reset(pollInterval)
+			}
 		case <-ticker.C:
+			prevProcessed := rp.Stats().Processed
 			if rp.processBatch(ctx) {
 				consecutiveErrors = 0
+				if rp.Stats().Processed == prevProcessed {
+					// Ran successfully but did no actual work — back off.
+					consecutiveIdle++
+					newInterval := pollInterval * time.Duration(1<<min(consecutiveIdle, 6))
+					if newInterval > maxIdleInterval {
+						newInterval = maxIdleInterval
+					}
+					ticker.Reset(newInterval)
+				} else {
+					// Real work done — reset to fast polling.
+					if consecutiveIdle > 0 {
+						consecutiveIdle = 0
+						ticker.Reset(pollInterval)
+					}
+				}
 			} else {
 				consecutiveErrors++
 				rp.backoff(ctx, consecutiveErrors)
 			}
 		}
 	}
+}
+
+// processBatchIdle wraps processBatch and updates the idle counter.
+// Used by the Notify path where we always want to run but still track idle state.
+func (rp *RetroactiveProcessor) processBatchIdle(ctx context.Context, consecutiveIdle *int) bool {
+	prev := rp.Stats().Processed
+	ok := rp.processBatch(ctx)
+	if ok && rp.Stats().Processed > prev {
+		*consecutiveIdle = 0
+	} else if ok {
+		(*consecutiveIdle)++
+	}
+	return ok
 }
 
 // backoff sleeps for an exponentially increasing duration (capped at maxBackoff)
@@ -168,7 +227,15 @@ func (rp *RetroactiveProcessor) backoff(ctx context.Context, consecutiveErrors i
 // inference call per micro-batch, then scatters vectors back individually.
 // For EnrichPlugin: processes one engram at a time (LLM call per engram).
 func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
-	total, err := rp.store.CountWithoutFlag(ctx, rp.flagBit)
+	// Reset rate/ETA at the start of every pass so stale values from a prior
+	// pass don't leak into the embed-status API response while the processor is idle.
+	rp.statsMu.Lock()
+	rp.stats.RatePerSec = 0
+	rp.stats.ETASeconds = 0
+	rp.statsMu.Unlock()
+
+	skipFlags := rp.skipFlags()
+	total, err := rp.store.CountWithoutFlag(ctx, rp.flagBit, skipFlags)
 	if err != nil {
 		slog.Error("retroactive processor: count failed", "plugin", rp.plugin.Name(), "error", err)
 		return false
@@ -178,13 +245,18 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 		return true
 	}
 
-	slog.Info("retroactive processor: starting", "plugin", rp.plugin.Name(), "total", total)
+	// Snapshot cumulative processed count so we can detect per-pass work.
+	rp.statsMu.RLock()
+	passStart := rp.stats.Processed
+	rp.statsMu.RUnlock()
+
+	slog.Debug("retroactive processor: starting", "plugin", rp.plugin.Name(), "total", total)
 
 	rp.statsMu.Lock()
 	rp.stats.Total += total
 	rp.statsMu.Unlock()
 
-	iter := rp.store.ScanWithoutFlag(ctx, rp.flagBit)
+	iter := rp.store.ScanWithoutFlag(ctx, rp.flagBit, skipFlags)
 	if iter == nil {
 		slog.Error("retroactive processor: failed to create iterator", "plugin", rp.plugin.Name())
 		return false
@@ -211,10 +283,24 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 		}
 		vecs, embedErr := embedPlugin.Embed(ctx, microTexts)
 		if embedErr != nil {
+			ids := make([]string, len(microEngrams))
+			for i, e := range microEngrams {
+				ids[i] = e.ID.String()
+			}
 			slog.Warn("retroactive processor: embed batch failed",
 				"plugin", rp.plugin.Name(),
 				"batch_size", len(microEngrams),
+				"engram_ids", ids,
 				"error", embedErr)
+			// Mark each engram with DigestEmbedFailed so the processor does not
+			// retry them indefinitely. If the underlying provider recovers, an
+			// operator can clear the flag manually or via the admin API.
+			for _, e := range microEngrams {
+				if flagErr := rp.store.SetDigestFlag(ctx, e.ID, DigestEmbedFailed); flagErr != nil {
+					slog.Warn("retroactive processor: failed to set DigestEmbedFailed",
+						"plugin", rp.plugin.Name(), "engram_id", e.ID.String(), "error", flagErr)
+				}
+			}
 			rp.statsMu.Lock()
 			rp.stats.Errors += int64(len(microEngrams))
 			rp.statsMu.Unlock()
@@ -251,30 +337,39 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			}
 			rp.statsMu.Lock()
 			rp.stats.Processed++
-			processed := rp.stats.Processed
 			rp.statsMu.Unlock()
+		}
+		microEngrams = microEngrams[:0]
+		microTexts = microTexts[:0]
 
-			if processed%1000 == 0 {
-				elapsed := time.Since(startTime).Seconds()
-				if elapsed > 0 {
-					rate := float64(processed) / elapsed
-					remaining := total - processed
-					etaSeconds := int64(float64(remaining) / rate)
-					rp.statsMu.Lock()
-					rp.stats.RatePerSec = rate
-					rp.stats.ETASeconds = etaSeconds
-					rp.statsMu.Unlock()
-					slog.Info("retroactive processor: progress",
+		// Rate/ETA fires after every micro-batch (not gated on %100 — always update).
+		// Use pass-local count (flushedProcessed - passStart) so rate reflects this
+		// pass's throughput, not the cumulative total across all passes.
+		// Log message fires only at 100-engram boundaries to avoid log spam.
+		rp.statsMu.RLock()
+		flushedProcessed := rp.stats.Processed
+		rp.statsMu.RUnlock()
+		passProcessedSoFar := flushedProcessed - passStart
+		if passProcessedSoFar > 0 {
+			elapsed := time.Since(startTime).Seconds()
+			if elapsed > 0 {
+				rate := float64(passProcessedSoFar) / elapsed
+				remaining := total - passProcessedSoFar
+				etaSeconds := int64(float64(remaining) / rate)
+				rp.statsMu.Lock()
+				rp.stats.RatePerSec = rate
+				rp.stats.ETASeconds = etaSeconds
+				rp.statsMu.Unlock()
+				if passProcessedSoFar%100 == 0 {
+					slog.Info("retroactive: progress",
 						"plugin", rp.plugin.Name(),
-						"processed", processed,
+						"processed", flushedProcessed,
 						"total", total,
 						"rate_per_sec", rate,
 						"eta_seconds", etaSeconds)
 				}
 			}
 		}
-		microEngrams = microEngrams[:0]
-		microTexts = microTexts[:0]
 	}
 
 	for iter.Next() {
@@ -313,7 +408,25 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 		}
 
 		// Non-embed (enrich) path: one-at-a-time as before.
-		if err := rp.processEngram(ctx, eng); err != nil {
+		if err := rp.processEnrichEngram(ctx, eng); err != nil {
+			if errors.Is(err, ErrNothingToEnrich) {
+				// Nothing to enrich is not a failure — mark the engram as
+				// enrichment-complete so it is not retried on the next scan.
+				slog.Debug("retroactive processor: nothing to enrich, marking complete",
+					"plugin", rp.plugin.Name(),
+					"engram_id", eng.ID.String())
+				if flagErr := rp.store.SetDigestFlag(ctx, eng.ID, rp.flagBit); flagErr != nil {
+					slog.Warn("retroactive processor: failed to set digest flag after nothing-to-enrich",
+						"plugin", rp.plugin.Name(),
+						"engram_id", eng.ID.String(),
+						"error", flagErr)
+				}
+				rp.statsMu.Lock()
+				rp.stats.Processed++
+				rp.statsMu.Unlock()
+				batchCount++
+				continue
+			}
 			slog.Warn("retroactive processor: failed to process engram",
 				"plugin", rp.plugin.Name(),
 				"engram_id", eng.ID.String(),
@@ -346,11 +459,12 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			runtime.Gosched()
 		}
 
-		if processed%1000 == 0 {
+		passProcessedSoFar := processed - passStart
+		if passProcessedSoFar%100 == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			if elapsed > 0 {
-				rate := float64(processed) / elapsed
-				remaining := total - processed
+				rate := float64(passProcessedSoFar) / elapsed
+				remaining := total - passProcessedSoFar
 				etaSeconds := int64(float64(remaining) / rate)
 
 				rp.statsMu.Lock()
@@ -373,44 +487,27 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 
 	rp.statsMu.Lock()
 	rp.stats.Status = "idle"
+	passProcessed := rp.stats.Processed - passStart
+	totalProcessed := rp.stats.Processed
+	totalErrors := rp.stats.Errors
 	rp.statsMu.Unlock()
 
-	slog.Info("retroactive processor: complete",
-		"plugin", rp.plugin.Name(),
-		"processed", rp.stats.Processed,
-		"errors", rp.stats.Errors)
+	if passProcessed > 0 {
+		slog.Info("retroactive processor: complete",
+			"plugin", rp.plugin.Name(),
+			"pass_processed", passProcessed,
+			"total_processed", totalProcessed,
+			"errors", totalErrors)
+	} else {
+		slog.Debug("retroactive processor: idle (phantom count)",
+			"plugin", rp.plugin.Name(),
+			"reported_total", total)
+	}
 
 	return true
 }
 
-func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) error {
-	// Check if this is an embed plugin
-	if embed, ok := rp.plugin.(EmbedPlugin); ok {
-		// Call Embed with the concept and content
-		text := eng.Concept + " " + eng.Content
-		vec, err := embed.Embed(ctx, []string{text})
-		if err != nil {
-			return err
-		}
-
-		// Store the embedding
-		if err := rp.store.UpdateEmbedding(ctx, eng.ID, vec); err != nil {
-			return err
-		}
-
-		// Insert into HNSW index
-		if err := rp.store.HNSWInsert(ctx, eng.ID, vec); err != nil {
-			return err
-		}
-
-		// Auto-link by embedding
-		if err := rp.store.AutoLinkByEmbedding(ctx, eng.ID, vec); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
+func (rp *RetroactiveProcessor) processEnrichEngram(ctx context.Context, eng *Engram) error {
 	// Check if this is an enrich plugin
 	if enrich, ok := rp.plugin.(EnrichPlugin); ok {
 		// Read per-stage digest flags so we don't re-run stages the caller already provided.
@@ -418,8 +515,12 @@ func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) 
 		// conflated summarization keypoints with entity extraction. Flags are authoritative.
 		flags, err := rp.store.GetDigestFlags(ctx, eng.ID)
 		if err != nil {
-			slog.Warn("enrich: failed to read digest flags, skipping engram", "id", eng.ID.String(), "err", err)
-			return nil
+			if errors.Is(err, pebble.ErrNotFound) {
+				flags = 0
+			} else {
+				slog.Warn("enrich: failed to read digest flags, skipping engram", "id", eng.ID.String(), "err", err)
+				return nil
+			}
 		}
 		hasSummary := eng.Summary != "" || (flags&DigestSummarized != 0)
 		hasEntities := flags&DigestEntities != 0
@@ -436,6 +537,9 @@ func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) 
 		if err != nil {
 			return err
 		}
+		if result == nil {
+			return fmt.Errorf("enrich returned nil result")
+		}
 
 		// Only overwrite fields the caller didn't provide.
 		// hasSummary covers both eng.Summary != "" and DigestSummarized flag;
@@ -447,45 +551,15 @@ func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) 
 			}
 		}
 
-		// Store the enrichment result
-		if err := rp.store.UpdateDigest(ctx, eng.ID, result); err != nil {
+		if hasEntities {
+			result.Entities = nil
+		}
+		if hasRelationships {
+			result.Relationships = nil
+		}
+
+		if err := PersistEnrichmentResult(ctx, rp.store, eng.ID, result); err != nil {
 			return err
-		}
-
-		// Upsert entities (only if caller didn't provide them)
-		if !hasEntities {
-			var linkedEntityNames []string
-			for _, entity := range result.Entities {
-				if err := rp.store.UpsertEntity(ctx, entity); err != nil {
-					slog.Warn("enrich: failed to upsert entity", "id", eng.ID.String(), "name", entity.Name, "err", err)
-					continue
-				}
-				if err := rp.store.LinkEngramToEntity(ctx, eng.ID, entity.Name); err != nil {
-					slog.Warn("enrich: failed to link engram to entity", "id", eng.ID.String(), "name", entity.Name, "err", err)
-					continue
-				}
-				linkedEntityNames = append(linkedEntityNames, entity.Name)
-			}
-			// Write co-occurrence pairs for entities co-appearing in this engram.
-			for i := 0; i < len(linkedEntityNames); i++ {
-				for j := i + 1; j < len(linkedEntityNames); j++ {
-					_ = rp.store.IncrementEntityCoOccurrence(ctx, eng.ID, linkedEntityNames[i], linkedEntityNames[j])
-				}
-			}
-		}
-
-		// Mark entity extraction complete so subsequent polls skip this stage.
-		if !hasEntities && len(result.Entities) > 0 {
-			if err := rp.store.SetDigestFlag(ctx, eng.ID, DigestEntities); err != nil {
-				slog.Warn("enrich: failed to set DigestEntities flag", "id", eng.ID.String(), "err", err)
-			}
-		}
-
-		// Upsert relationships
-		for _, rel := range result.Relationships {
-			if err := rp.store.UpsertRelationship(ctx, eng.ID, rel); err != nil {
-				slog.Warn("failed to upsert relationship", "error", err)
-			}
 		}
 
 		return nil

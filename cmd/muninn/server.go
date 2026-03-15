@@ -592,6 +592,8 @@ func parseListenHost(args []string, envVal string) string {
 }
 
 func runServer() {
+	loadEnvFile()
+
 	// Apply memory limits before any significant allocations.
 	applyMemoryLimits()
 
@@ -612,7 +614,7 @@ func runServer() {
 		uiAddrDefault = v
 	}
 	uiAddr := flag.String("ui-addr", uiAddrDefault, "Web UI HTTP listen address")
-	mcpToken := flag.String("mcp-token", "", "Bearer token for MCP auth (empty = no auth)")
+	mcpToken := flag.String("mcp-token", "", "Bearer token override for MCP auth (leave empty to read from ~/.muninn/mcp.token)")
 	dev := flag.Bool("dev", false, "serve web assets from ./web directory (development mode)")
 	backupInterval := flag.String("backup-interval", "", "Automated backup interval (e.g. 6h, 30m); empty = disabled")
 	backupDir := flag.String("backup-dir", "", "Directory to write automated backups into")
@@ -638,6 +640,9 @@ func runServer() {
 		fmt.Fprintf(os.Stderr, "  MUNINN_LOCAL_EMBED           Set to \"0\" to disable bundled ONNX embedder\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_ENRICH_URL            LLM enrichment endpoint URL (optional)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_ENRICH_API_KEY        API key for enrichment (or MUNINN_ANTHROPIC_KEY)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_ENRICH_TIMEOUT        Per-engram LLM timeout for replay_enrichment (e.g. 60s, 2m; default: no extra timeout)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_HNSW_WARN_THRESHOLD_MB  Emit a warning when HNSW in-memory vector bytes exceed N MB (optional)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_HNSW_MAX_MB             Skip HNSW insert (keep Pebble write) when memory exceeds N MB (optional)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_LISTEN_HOST           Host to bind all servers to (e.g. 0.0.0.0 for LAN access)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_CORS_ORIGINS          Comma-separated CORS allowed origins\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_MEM_LIMIT_GB          Memory limit in GB (default: 4)\n")
@@ -649,6 +654,20 @@ func runServer() {
 		fmt.Fprintf(os.Stderr, "  MUNINN_BACKUP_RETAIN          Number of automated backups to keep (default: 5)\n")
 	}
 	flag.Parse()
+
+	// Persist actual bound addresses so 'muninn status' and the startup health poll
+	// can probe the correct ports when non-default --*-addr flags are used.
+	_ = writeAddrsFile(*dataDir, daemonAddrs{
+		RestAddr: *restAddr,
+		MCPAddr:  *mcpAddr,
+		UIAddr:   *uiAddr,
+	})
+
+	// MCP token: --mcp-token flag is an explicit override (tests, container entrypoints).
+	// Default path reads from ~/.muninn/mcp.token so the token never appears in `ps` output.
+	if *mcpToken == "" {
+		*mcpToken = readTokenFile()
+	}
 
 	// TLS env fallbacks — flags take priority; env vars are the fallback.
 	if *tlsCert == "" {
@@ -784,6 +803,11 @@ func runServer() {
 		Description: "backfill embed_dim in ERF records for existing embeddings",
 		Up:          migrate.BackfillEmbedDim,
 	})
+	migRunner.Register(migrate.Migration{
+		Version:     2,
+		Description: "backfill relationship entity index (0x26) for GetEntityAggregate optimisation",
+		Up:          migrate.BackfillRelEntityIndex,
+	})
 	if applied, err := migRunner.Run(); err != nil {
 		slog.Error("migration failed", "err", err)
 		db.Close()
@@ -892,6 +916,13 @@ func runServer() {
 
 	// Determine embedder provider and model for the status endpoint.
 	embedInfo := resolveEmbedInfo(savedPluginCfg)
+	// Wire hardware acceleration flag once at startup (captured before first request).
+	if embedPlugin != nil {
+		if h, ok := embedPlugin.(plugin.HardwareAwarePlugin); ok {
+			v := h.HardwareAccelerated()
+			embedInfo.HardwareAccelerated = &v
+		}
+	}
 
 	// Build enrich plugin (optional): env vars → saved config.
 	enrichCtx, enrichCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -900,6 +931,31 @@ func runServer() {
 
 	// Build HNSW registry (multi-vault, lazy-loading)
 	hnswRegistry := hnswpkg.NewRegistry(db)
+
+	// Apply optional memory thresholds from environment variables.
+	//
+	//   MUNINN_HNSW_WARN_THRESHOLD_MB  – emit a throttled slog.Warn when total
+	//                                    in-memory vector bytes exceed this value
+	//                                    (no insert penalty; default: disabled).
+	//   MUNINN_HNSW_MAX_MB             – skip graph insert when total bytes meet
+	//                                    or exceed this value (vector still stored
+	//                                    in Pebble; FTS unaffected; default: disabled).
+	if warnMBStr := os.Getenv("MUNINN_HNSW_WARN_THRESHOLD_MB"); warnMBStr != "" {
+		if warnMB, err := strconv.ParseInt(warnMBStr, 10, 64); err != nil || warnMB <= 0 {
+			slog.Warn("invalid MUNINN_HNSW_WARN_THRESHOLD_MB, ignoring", "value", warnMBStr)
+		} else {
+			hnswRegistry.SetWarnThresholdBytes(warnMB << 20)
+			slog.Info("hnsw: memory warn threshold configured", "warn_threshold_mb", warnMB)
+		}
+	}
+	if maxMBStr := os.Getenv("MUNINN_HNSW_MAX_MB"); maxMBStr != "" {
+		if maxMB, err := strconv.ParseInt(maxMBStr, 10, 64); err != nil || maxMB <= 0 {
+			slog.Warn("invalid MUNINN_HNSW_MAX_MB, ignoring", "value", maxMBStr)
+		} else {
+			hnswRegistry.SetMaxBytes(maxMB << 20)
+			slog.Info("hnsw: hard memory limit configured", "max_mb", maxMB)
+		}
+	}
 
 	// Build activation engine
 	actEngine := activation.New(store, activation.NewFTSAdapter(ftsIndex), activation.NewHNSWAdapter(hnswRegistry), embedder)
@@ -920,10 +976,18 @@ func runServer() {
 	actEngine.SetTransitionStore(store.TransitionCache())
 
 	// Build engine API - pass the full worker implementations
-	eng := engine.NewEngine(store, authStore, ftsIndex, actEngine, trigSystem,
-		hebbianWorkerImpl,
-		contradictWorkerImpl.Worker, confidenceWorkerImpl.Worker,
-		embedder, hnswRegistry)
+	eng := engine.NewEngine(engine.EngineConfig{
+		Store:            store,
+		AuthStore:        authStore,
+		FTSIndex:         ftsIndex,
+		ActivationEngine: actEngine,
+		TriggerSystem:    trigSystem,
+		HebbianWorker:    hebbianWorkerImpl,
+		ContradictWorker: contradictWorkerImpl.Worker,
+		ConfidenceWorker: confidenceWorkerImpl.Worker,
+		Embedder:         embedder,
+		HNSWRegistry:     hnswRegistry,
+	})
 
 	eng.SetTransitionWorker(transitionWorkerImpl)
 
@@ -987,8 +1051,27 @@ func runServer() {
 		if err := pluginRegistry.Register(enrichPlugin); err != nil {
 			slog.Warn("failed to register enrich plugin in registry", "err", err)
 		}
+		eng.SetEnrichPlugin(enrichPlugin)
+		if timeoutStr := os.Getenv("MUNINN_ENRICH_TIMEOUT"); timeoutStr != "" {
+			if d, err := time.ParseDuration(timeoutStr); err == nil && d > 0 {
+				eng.SetReplayEnrichTimeout(d)
+				slog.Info("replay enrichment per-engram timeout configured", "timeout", d)
+			} else if err != nil {
+				slog.Warn("MUNINN_ENRICH_TIMEOUT invalid, ignoring", "value", timeoutStr, "err", err)
+			}
+		}
 		if rew, ok := restWrapper.(*rest.RESTEngineWrapper); ok {
 			rew.SetEnricher(enrichPlugin)
+		}
+		// Wire circuit-breaker state-change hook so transitions emit structured
+		// log lines and update the plugin registry health status.
+		if es, ok := enrichPlugin.(interface {
+			SetBreakerStateChangeHook(interface {
+				SetHealthy(name string, healthy bool)
+				SetUnhealthy(name string, err error)
+			})
+		}); ok {
+			es.SetBreakerStateChangeHook(pluginRegistry)
 		}
 	}
 

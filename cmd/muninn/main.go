@@ -46,7 +46,9 @@ func main() {
 	case "shell":
 		runShell()
 	case "start":
-		runStart(true)
+		if err := runStart(true); err != nil {
+			os.Exit(1)
+		}
 	case "start:web":
 		runStartService("web")
 	case "stop":
@@ -55,13 +57,17 @@ func main() {
 		runStopService("web")
 	case "status":
 		runStatus()
+	case "exec":
+		runExec(rest)
 	case "backup":
 		runBackup(rest)
 	case "upgrade":
 		runUpgrade(rest)
 	case "restart":
 		runStop()
-		runStart(true)
+		if err := runStart(true); err != nil {
+			os.Exit(1)
+		}
 	case "show:vaults":
 		runShowVaults()
 	case "mcp":

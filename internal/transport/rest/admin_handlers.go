@@ -101,8 +101,11 @@ func (s *Server) handleCreateAPIKey(authStore *auth.Store) http.HandlerFunc {
 			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "label too long")
 			return
 		}
-		if req.Mode != "" && req.Mode != "full" && req.Mode != "observe" {
-			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "mode must be 'full' or 'observe'")
+		if req.Mode == "" {
+			req.Mode = auth.ModeFull // default to full access when mode is not specified
+		}
+		if req.Mode != auth.ModeFull && req.Mode != auth.ModeObserve && req.Mode != auth.ModeWrite {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "mode must be 'full', 'observe', or 'write'")
 			return
 		}
 		var expiresAt *time.Time
@@ -119,6 +122,7 @@ func (s *Server) handleCreateAPIKey(authStore *auth.Store) http.HandlerFunc {
 			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
 			return
 		}
+		key.StorageHash = nil // never leak the storage hash to API consumers
 		s.sendJSON(w, http.StatusCreated, map[string]interface{}{
 			"token": token, // shown once
 			"key":   key,
@@ -185,6 +189,9 @@ func (s *Server) handleListAPIKeys(authStore *auth.Store) http.HandlerFunc {
 			s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, "failed to list API keys")
 			return
 		}
+		for i := range keys {
+			keys[i].StorageHash = nil // never leak the storage hash to API consumers
+		}
 		s.sendJSON(w, http.StatusOK, map[string]interface{}{"keys": keys})
 	}
 }
@@ -201,7 +208,11 @@ func (s *Server) handleRevokeAPIKey(authStore *auth.Store) http.HandlerFunc {
 			return
 		}
 		if err := authStore.RevokeAPIKey(vault, id); err != nil {
-			s.sendError(r, w, http.StatusNotFound, ErrEngramNotFound, err.Error())
+			if errors.Is(err, auth.ErrKeyNotFound) {
+				s.sendError(r, w, http.StatusNotFound, ErrEngramNotFound, err.Error())
+				return
+			}
+			s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 			return
 		}
 		s.sendJSON(w, http.StatusOK, map[string]interface{}{"revoked": id})
@@ -219,7 +230,11 @@ func (s *Server) handleChangeAdminPassword(authStore *auth.Store) http.HandlerFu
 			return
 		}
 		if req.NewPassword == "" {
-			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "new_password is required")
+			s.sendError(r, w, http.StatusBadRequest, ErrAuthFailed, "new_password is required")
+			return
+		}
+		if len(req.NewPassword) < 8 {
+			s.sendError(r, w, http.StatusBadRequest, ErrAuthFailed, "new_password must be at least 8 characters")
 			return
 		}
 		if err := authStore.ChangeAdminPassword(req.Username, req.NewPassword); err != nil {
@@ -442,7 +457,10 @@ func (s *Server) handleMCPInfo(w http.ResponseWriter, r *http.Request) {
 // server directly — which fails in remote deployments where the MCP address
 // resolves to 127.0.0.1 from the server's perspective but not the browser's.
 func (s *Server) handleEntityGraph(w http.ResponseWriter, r *http.Request) {
-	vault := ctxVault(r)
+	vault := r.URL.Query().Get("vault")
+	if vault == "" {
+		vault = "default"
+	}
 	if !isValidVaultName(vault) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid vault name")
 		return
@@ -481,26 +499,43 @@ type EmbedStatusResponse struct {
 	EmbeddedCount int64  `json:"embedded_count"` // -1 = unknown
 	TotalCount    int64  `json:"total_count"`    // -1 = unknown
 	Indexing      bool   `json:"indexing"`
+	// RatePerSec is the current embedding rate in engrams per second; 0 when not indexing.
+	RatePerSec float64 `json:"rate_per_sec"`
+	// ETASeconds is the estimated seconds until indexing completes; 0 when not indexing or rate unknown.
+	ETASeconds int64 `json:"eta_seconds"`
+	// HardwareAccelerated is nil for cloud providers; true/false for Ollama (GPU vs CPU).
+	HardwareAccelerated *bool `json:"hardware_accelerated,omitempty"`
 }
 
 // handleEmbedStatus returns the current embedder configuration and indexing state.
 func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
-	resp, err := s.engine.Stat(r.Context(), &StatRequest{})
+	statResp, err := s.engine.Stat(r.Context(), &StatRequest{})
 	totalCount := int64(-1)
 	if err == nil {
-		totalCount = int64(resp.EngramCount)
+		totalCount = int64(statResp.EngramCount)
 	}
 
 	embeddedCount := s.engine.CountEmbedded(r.Context())
+	indexing := embeddedCount >= 0 && totalCount >= 0 && embeddedCount < totalCount
 
-	s.sendJSON(w, http.StatusOK, EmbedStatusResponse{
-		Provider:      s.embedProvider,
-		Model:         s.embedModel,
-		Enabled:       s.embedProvider != "" && s.embedProvider != "none",
-		EmbeddedCount: embeddedCount,
-		TotalCount:    totalCount,
-		Indexing:      embeddedCount >= 0 && totalCount >= 0 && embeddedCount < totalCount,
-	})
+	resp := EmbedStatusResponse{
+		Provider:            s.embedProvider,
+		Model:               s.embedModel,
+		Enabled:             s.embedProvider != "" && s.embedProvider != "none",
+		EmbeddedCount:       embeddedCount,
+		TotalCount:          totalCount,
+		Indexing:            indexing,
+		HardwareAccelerated: s.embedHardwareAccelerated,
+	}
+
+	// Only populate rate/ETA when actively indexing.
+	if indexing {
+		stats := s.engine.EmbedStats()
+		resp.RatePerSec = stats.RatePerSec
+		resp.ETASeconds = stats.ETASeconds
+	}
+
+	s.sendJSON(w, http.StatusOK, resp)
 }
 
 // PluginStatusResponse is one entry in GET /api/admin/plugins.

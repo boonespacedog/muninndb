@@ -1,6 +1,9 @@
 package plugin
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // PluginTier identifies the tier level of a plugin.
 type PluginTier int
@@ -22,7 +25,8 @@ type PluginConfig struct {
 type EnrichmentResult struct {
 	Summary        string              // abstractive summary (replaces extractive)
 	KeyPoints      []string            // semantic key points (replaces IDF-based)
-	MemoryType     string              // nuanced classification (e.g., "architectural_decision")
+	MemoryType     string              // canonical memory type (e.g., "decision")
+	TypeLabel      string              // nuanced classification label (e.g., "architectural_decision")
 	Classification string              // topic category (e.g., "infrastructure/databases")
 	Entities       []ExtractedEntity   // people, projects, tools, organizations
 	Relationships  []ExtractedRelation // typed relationships between entities
@@ -43,6 +47,11 @@ type ExtractedRelation struct {
 	Weight     float32 // 0.0-1.0 confidence in this relationship
 }
 
+// ErrNothingToEnrich is returned when all pipeline stages are skipped because
+// the engram already has inline data (e.g., Summary set by caller during Write).
+// This is distinct from a real failure where LLM/network errors caused stages to fail.
+var ErrNothingToEnrich = errors.New("enrich: nothing to enrich")
+
 // DigestFlags tracks which processing stages have been applied to an engram.
 // Stored in the ERF metadata Reserved section at offset 68 (first byte of Reserved).
 const (
@@ -55,6 +64,11 @@ const (
 	DigestRelationships uint8 = 0x10 // relationship extraction complete
 	DigestClassified    uint8 = 0x20 // classification complete
 	DigestSummarized    uint8 = 0x40 // summarization complete
+
+	// DigestEmbedFailed is set when an embed batch permanently fails for an engram.
+	// Engrams with this flag are skipped by the embed retroactive processor so
+	// they are not retried indefinitely.
+	DigestEmbedFailed uint8 = 0x80
 )
 
 // PluginStatus represents the runtime state of a registered plugin.
@@ -69,11 +83,17 @@ type PluginStatus struct {
 // RetroactiveStats is the progress of a retroactive processor.
 type RetroactiveStats struct {
 	PluginName string    `json:"plugin_name"`
-	Status     string    `json:"status"`     // "running", "complete", "paused", "failed"
+	Status     string    `json:"status"` // "running", "complete", "paused", "failed"
 	Processed  int64     `json:"processed"`
 	Total      int64     `json:"total"`
 	RatePerSec float64   `json:"rate_per_sec"`
 	ETASeconds int64     `json:"eta_seconds"`
 	StartedAt  time.Time `json:"started_at"`
 	Errors     int64     `json:"errors"` // count of skipped engrams
+}
+
+// HardwareAwarePlugin is implemented by providers that can report
+// whether they are running with hardware acceleration (e.g., GPU).
+type HardwareAwarePlugin interface {
+	HardwareAccelerated() bool
 }

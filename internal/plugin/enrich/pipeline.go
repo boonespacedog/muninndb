@@ -4,11 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/config"
 	"github.com/scrypster/muninndb/internal/plugin"
+	"github.com/scrypster/muninndb/internal/plugin/llmstats"
 	"github.com/scrypster/muninndb/internal/storage"
 )
+
+// ErrNothingToEnrich is returned when all pipeline stages are skipped because
+// the engram already has inline data (e.g., Summary set by caller during Write).
+// This is distinct from a real failure where LLM/network errors caused stages to fail.
+// Defined in the plugin package; aliased here for backwards compatibility.
+var ErrNothingToEnrich = plugin.ErrNothingToEnrich
 
 // EnrichmentPipeline orchestrates the LLM calls per engram.
 // In full mode (default) it runs up to 4 calls: entity extraction,
@@ -20,6 +29,7 @@ type EnrichmentPipeline struct {
 	prompts  *Prompts
 	limiter  *TokenBucketLimiter
 	cfg      *config.PluginConfig
+	stats    llmstats.LLMCallStats
 }
 
 // NewPipeline creates a new enrichment pipeline.
@@ -37,6 +47,41 @@ func (p *EnrichmentPipeline) SetConfig(cfg *config.PluginConfig) {
 	p.cfg = cfg
 }
 
+// LLMStats returns a point-in-time snapshot of LLM call metrics.
+func (p *EnrichmentPipeline) LLMStats() llmstats.Snapshot {
+	return p.stats.Snapshot()
+}
+
+// verboseLogsFlag returns the LLMVerboseLogs config flag pointer, or nil if cfg is nil.
+func (p *EnrichmentPipeline) verboseLogsFlag() *bool {
+	if p.cfg == nil {
+		return nil
+	}
+	return p.cfg.LLMVerboseLogs
+}
+
+// recordComplete updates aggregate stats and emits a verbose log entry when enabled.
+func (p *EnrichmentPipeline) recordComplete(ctx context.Context, callType string, latMs int64, err error) {
+	p.stats.TotalCalls.Add(1)
+	p.stats.TotalLatencyMs.Add(latMs)
+	if err != nil {
+		p.stats.TotalErrors.Add(1)
+	}
+	if llmstats.VerboseEnabled(p.verboseLogsFlag()) {
+		attrs := []any{
+			"source", "llm",
+			"subsystem", "enrich",
+			"call_type", callType,
+			"provider", p.provider.Name(),
+			"latency_ms", latMs,
+		}
+		if err != nil {
+			attrs = append(attrs, "error", err.Error())
+		}
+		slog.InfoContext(ctx, "llm.complete", attrs...)
+	}
+}
+
 // stageEnabled returns whether a named stage is enabled given config and light-mode rules.
 func (p *EnrichmentPipeline) stageEnabled(stage string) bool {
 	if p.cfg == nil {
@@ -51,8 +96,8 @@ func (p *EnrichmentPipeline) stageEnabled(stage string) bool {
 // Run executes the enrichment pipeline for one engram.
 // The engram's existing fields are checked: if a stage's output is already
 // present (caller-provided via inline enrichment), that stage is skipped.
-// Returns nil, nil if all calls fail (graceful degradation).
-// Returns error only if the entire pipeline is completely unavailable.
+// Returns an error if every enabled stage either fails or produces no output.
+// Partial failures are logged per-stage and still return any successful output.
 func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (result *plugin.EnrichmentResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -62,6 +107,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 	}()
 
 	result = &plugin.EnrichmentResult{}
+	var stageErrors []string
 
 	// Call 1: Entity extraction
 	var entities []plugin.ExtractedEntity
@@ -69,6 +115,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		ents, err := p.extractEntities(ctx, eng)
 		if err != nil {
 			slog.Warn("enrich: entity extraction failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("entities: %v", err))
 			ents = nil
 		}
 		entities = ents
@@ -80,6 +127,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		rels, err := p.extractRelationships(ctx, eng, entities)
 		if err != nil {
 			slog.Warn("enrich: relationship extraction failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("relationships: %v", err))
 			rels = nil
 		}
 		result.Relationships = rels
@@ -90,10 +138,11 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		memType, typeLabel, category, subcategory, tags, err := p.classify(ctx, eng)
 		if err != nil {
 			slog.Warn("enrich: classification failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("classification: %v", err))
 		} else {
-			mt, typeStr := resolveClassification(memType, typeLabel)
-			result.MemoryType = typeStr
-			_ = mt
+			mt, _ := resolveClassification(memType, typeLabel)
+			result.MemoryType = mt.String()
+			result.TypeLabel = typeLabel
 			if category != "" && subcategory != "" {
 				result.Classification = category + "/" + subcategory
 			}
@@ -106,6 +155,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		summary, keyPoints, err := p.summarize(ctx, eng)
 		if err != nil {
 			slog.Warn("enrich: summarization failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("summary: %v", err))
 		} else {
 			result.Summary = summary
 			result.KeyPoints = keyPoints
@@ -113,9 +163,13 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 	}
 
 	// If ALL stages produced nothing, return error so retry can be attempted
-	if result.Summary == "" && len(result.Entities) == 0 &&
-		result.MemoryType == "" && result.Classification == "" {
-		return nil, fmt.Errorf("enrich: all pipeline stages failed for engram %s", eng.ID.String())
+	if result.Summary == "" && len(result.KeyPoints) == 0 &&
+		len(result.Entities) == 0 && result.MemoryType == "" &&
+		result.TypeLabel == "" && result.Classification == "" {
+		if len(stageErrors) > 0 {
+			return nil, fmt.Errorf("enrich: all pipeline stages failed for engram %s: %s", eng.ID.String(), strings.Join(stageErrors, "; "))
+		}
+		return nil, fmt.Errorf("engram %s: %w", eng.ID.String(), ErrNothingToEnrich)
 	}
 
 	return result, nil
@@ -181,7 +235,9 @@ func (p *EnrichmentPipeline) extractEntities(ctx context.Context, eng *storage.E
 	}
 
 	userMsg := fmt.Sprintf("Concept: %s\n\nContent: %s", eng.Concept, eng.Content)
+	start := time.Now()
 	resp, err := p.provider.Complete(ctx, p.prompts.EntitiesSystem, userMsg)
+	p.recordComplete(ctx, "entities", time.Since(start).Milliseconds(), err)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +263,9 @@ func (p *EnrichmentPipeline) extractRelationships(ctx context.Context, eng *stor
 
 	userMsg := fmt.Sprintf("Entities: %s\n\nConcept: %s\n\nContent: %s",
 		entitiesJSON, eng.Concept, eng.Content)
+	start := time.Now()
 	resp, err := p.provider.Complete(ctx, p.prompts.RelationshipsSystem, userMsg)
+	p.recordComplete(ctx, "relationships", time.Since(start).Milliseconds(), err)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +280,9 @@ func (p *EnrichmentPipeline) classify(ctx context.Context, eng *storage.Engram) 
 	}
 
 	userMsg := fmt.Sprintf("Concept: %s\n\nContent: %s", eng.Concept, eng.Content)
+	start := time.Now()
 	resp, err := p.provider.Complete(ctx, p.prompts.ClassifySystem, userMsg)
+	p.recordComplete(ctx, "classification", time.Since(start).Milliseconds(), err)
 	if err != nil {
 		return "", "", "", "", nil, err
 	}
@@ -237,7 +297,9 @@ func (p *EnrichmentPipeline) summarize(ctx context.Context, eng *storage.Engram)
 	}
 
 	userMsg := fmt.Sprintf("Concept: %s\n\nContent: %s", eng.Concept, eng.Content)
+	start := time.Now()
 	resp, err := p.provider.Complete(ctx, p.prompts.SummarizeSystem, userMsg)
+	p.recordComplete(ctx, "summary", time.Since(start).Milliseconds(), err)
 	if err != nil {
 		return "", nil, err
 	}

@@ -2,6 +2,7 @@ package rest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,22 @@ func TestCreateAPIKey(t *testing.T) {
 	}
 }
 
+// TestCreateAPIKey_WriteModeAccepted tests that "write" mode is accepted.
+func TestCreateAPIKey_WriteModeAccepted(t *testing.T) {
+	store := newTestAuthStore(t)
+	srv := newTestServer(t, store)
+
+	body, _ := json.Marshal(map[string]string{"vault": "default", "label": "bot", "mode": "write"})
+	req := httptest.NewRequest("POST", "/api/admin/keys", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected 201 for write mode, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestCreateAPIKeyInvalidMode tests that an invalid mode is rejected
 func TestCreateAPIKeyInvalidMode(t *testing.T) {
 	store := newTestAuthStore(t)
@@ -82,6 +99,33 @@ func TestCreateAPIKeyInvalidMode(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for invalid mode, got %d", w.Code)
+	}
+}
+
+// TestCreateAPIKey_DefaultsToFullMode tests that omitting mode defaults to "full".
+func TestCreateAPIKey_DefaultsToFullMode(t *testing.T) {
+	store := newTestAuthStore(t)
+	srv := newTestServer(t, store)
+
+	body, _ := json.Marshal(map[string]string{"vault": "default", "label": "default-mode-key"})
+	req := httptest.NewRequest("POST", "/api/admin/keys", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 when mode is omitted, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Key struct {
+			Mode string `json:"mode"`
+		} `json:"key"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Key.Mode != "full" {
+		t.Errorf("expected default mode 'full', got %q", resp.Key.Mode)
 	}
 }
 
@@ -673,5 +717,228 @@ func TestHandleRenameVault_DuplicateDetection(t *testing.T) {
 	}
 	if resp["conflict"] != "my-vault" {
 		t.Errorf("expected conflict=my-vault, got %q", resp["conflict"])
+	}
+}
+
+// TestEntityGraph_EmptyVaultDefaultsToDefault verifies that omitting the vault
+// query parameter defaults to the "default" vault.
+func TestEntityGraph_EmptyVaultDefaultsToDefault(t *testing.T) {
+	srv := newTestServer(t, newTestAuthStore(t))
+
+	req := httptest.NewRequest("GET", "/api/admin/entity-graph", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with no vault param, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestEntityGraph returns nodes/edges from the mock engine.
+func TestEntityGraph(t *testing.T) {
+	srv := newTestServer(t, newTestAuthStore(t))
+
+	req := httptest.NewRequest("GET", "/api/admin/entity-graph?vault=default", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp EntityGraphResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// MockEngine.ExportGraph returns empty graph — just verify the shape.
+	if resp.Nodes == nil {
+		t.Error("expected non-nil nodes slice")
+	}
+	if resp.Edges == nil {
+		t.Error("expected non-nil edges slice")
+	}
+}
+
+// TestEntityGraph_InvalidVault returns 400 for an invalid vault name.
+func TestEntityGraph_InvalidVault(t *testing.T) {
+	srv := newTestServer(t, newTestAuthStore(t))
+
+	req := httptest.NewRequest("GET", "/api/admin/entity-graph?vault=../../etc/passwd", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid vault, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestEntityGraph_RequiresAdminAuth verifies 401 is returned when auth is
+// configured and no session cookie is present.
+func TestEntityGraph_RequiresAdminAuth(t *testing.T) {
+	store := newTestAuthStore(t)
+	secret := []byte("test-session-secret-32bytes-ok!!")
+	srv := NewServer("localhost:0", &MockEngine{}, store, secret, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/admin/entity-graph?vault=default", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without session cookie, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestEntityGraph_AllowedWithValidSession verifies 200 with a valid session cookie.
+func TestEntityGraph_AllowedWithValidSession(t *testing.T) {
+	store := newTestAuthStore(t)
+	secret := []byte("test-session-secret-32bytes-ok!!")
+	srv := NewServer("localhost:0", &MockEngine{}, store, secret, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	token, err := auth.NewSessionToken("admin", secret)
+	if err != nil {
+		t.Fatalf("NewSessionToken: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/admin/entity-graph?vault=default", nil)
+	req.AddCookie(&http.Cookie{Name: "muninn_session", Value: token})
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid session cookie, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp EntityGraphResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Nodes == nil || resp.Edges == nil {
+		t.Error("expected non-nil nodes and edges")
+	}
+}
+
+// mockEngineWithStats embeds MockEngine but allows controlling EmbedStats and CountEmbedded.
+type mockEngineWithStats struct {
+	MockEngine
+	embedStats    plugin.RetroactiveStats
+	embeddedCount int64
+	totalCount    int64
+}
+
+func (m *mockEngineWithStats) EmbedStats() plugin.RetroactiveStats {
+	return m.embedStats
+}
+
+func (m *mockEngineWithStats) CountEmbedded(ctx context.Context) int64 {
+	return m.embeddedCount
+}
+
+func (m *mockEngineWithStats) Stat(ctx context.Context, req *StatRequest) (*StatResponse, error) {
+	return &StatResponse{
+		EngramCount:  m.totalCount,
+		VaultCount:   1,
+		StorageBytes: 1024,
+	}, nil
+}
+
+// TestHandleEmbedStatus_IncludesRateAndETA verifies that rate_per_sec and eta_seconds
+// are populated from EmbedStats when the server is actively indexing.
+func TestHandleEmbedStatus_IncludesRateAndETA(t *testing.T) {
+	eng := &mockEngineWithStats{
+		embedStats: plugin.RetroactiveStats{
+			RatePerSec: 1.5,
+			ETASeconds: 120,
+		},
+		embeddedCount: 50,  // less than total → indexing=true
+		totalCount:    100,
+	}
+	srv := NewServer("localhost:0", eng, nil, nil, nil, EmbedInfo{Provider: "ollama", Model: "nomic"}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/admin/embed/status", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp EmbedStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Indexing {
+		t.Error("expected indexing=true")
+	}
+	if resp.RatePerSec != 1.5 {
+		t.Errorf("expected rate_per_sec=1.5, got %v", resp.RatePerSec)
+	}
+	if resp.ETASeconds != 120 {
+		t.Errorf("expected eta_seconds=120, got %v", resp.ETASeconds)
+	}
+}
+
+// TestHandleEmbedStatus_ZeroRateWhenIdle verifies that rate_per_sec and eta_seconds
+// are 0 when the server is not actively indexing (all engrams already embedded).
+func TestHandleEmbedStatus_ZeroRateWhenIdle(t *testing.T) {
+	eng := &mockEngineWithStats{
+		embedStats: plugin.RetroactiveStats{
+			RatePerSec: 5.0,
+			ETASeconds: 999,
+		},
+		embeddedCount: 100,  // equal to total → indexing=false
+		totalCount:    100,
+	}
+	srv := NewServer("localhost:0", eng, nil, nil, nil, EmbedInfo{Provider: "ollama", Model: "nomic"}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/admin/embed/status", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp EmbedStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Indexing {
+		t.Error("expected indexing=false when all engrams are embedded")
+	}
+	if resp.RatePerSec != 0 {
+		t.Errorf("expected rate_per_sec=0 when idle, got %v", resp.RatePerSec)
+	}
+	if resp.ETASeconds != 0 {
+		t.Errorf("expected eta_seconds=0 when idle, got %v", resp.ETASeconds)
+	}
+}
+
+// TestHandleEmbedStatus_HardwareAccelerated verifies that hardware_accelerated
+// is reflected correctly in the response when set on the server.
+func TestHandleEmbedStatus_HardwareAccelerated(t *testing.T) {
+	trueVal := true
+	eng := &mockEngineWithStats{
+		embeddedCount: 100,
+		totalCount:    100,
+	}
+	srv := NewServer("localhost:0", eng, nil, nil, nil,
+		EmbedInfo{Provider: "ollama", Model: "nomic", HardwareAccelerated: &trueVal},
+		EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/admin/embed/status", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp EmbedStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.HardwareAccelerated == nil {
+		t.Fatal("expected hardware_accelerated to be non-nil")
+	}
+	if !*resp.HardwareAccelerated {
+		t.Error("expected hardware_accelerated=true")
 	}
 }

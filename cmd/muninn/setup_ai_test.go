@@ -363,175 +363,66 @@ func TestOpenClawConfigPath(t *testing.T) {
 	}
 }
 
-// TestOpenClawMCPEntry verifies the stdio entry has command/args/transport and no URL/token.
-func TestOpenClawMCPEntry(t *testing.T) {
-	entry := openClawMCPEntry()
-	if entry["command"] != "muninn" {
-		t.Errorf("command = %v, want \"muninn\"", entry["command"])
-	}
-	args, ok := entry["args"].([]any)
-	if !ok || len(args) != 1 || args[0] != "mcp" {
-		t.Errorf("args = %v, want [\"mcp\"]", entry["args"])
-	}
-	if entry["transport"] != "stdio" {
-		t.Errorf("transport = %v, want \"stdio\"", entry["transport"])
-	}
-	// No URL or token — the proxy binary handles auth at runtime.
-	if _, ok := entry["url"]; ok {
-		t.Error("url must not be present in stdio entry")
-	}
-	if _, ok := entry["headers"]; ok {
-		t.Error("headers must not be present in stdio entry")
-	}
-}
+// --- OpenClaw bad config cleanup (migration from v0.3.13-alpha) ---
 
-func TestMergeOpenClawMCP_PreservesOtherEntries(t *testing.T) {
-	cfg := map[string]any{
-		"mcpServers": map[string]any{
-			"other-tool": map[string]any{"command": "other", "transport": "stdio"},
-		},
-		"topKey": "preserved",
-	}
-	mergeOpenClawMCP(cfg)
-	servers := cfg["mcpServers"].(map[string]any)
-	if _, ok := servers["other-tool"]; !ok {
-		t.Error("other-tool entry removed")
-	}
-	if _, ok := servers["muninn"]; !ok {
-		t.Error("muninn not added")
-	}
-	if cfg["topKey"] != "preserved" {
-		t.Error("top-level key lost")
-	}
-}
-
-func TestMergeOpenClawMCP_EmptyConfig(t *testing.T) {
-	cfg := map[string]any{}
-	mergeOpenClawMCP(cfg)
-	servers, ok := cfg["mcpServers"].(map[string]any)
-	if !ok {
-		t.Fatal("cfg[\"mcpServers\"] not a map")
-	}
-	if _, ok := servers["muninn"]; !ok {
-		t.Error("muninn not added")
-	}
-}
-
-func TestConfigureOpenClaw_WritesCorrectSchema(t *testing.T) {
-	_, cleanup := withTempHome(t)
-	defer cleanup()
-
-	out := captureStdout(func() {
-		if err := configureOpenClaw("http://127.0.0.1:8750/mcp", "mdb_testtoken"); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
-	data, err := os.ReadFile(openClawConfigPath())
-	if err != nil {
-		t.Fatalf("config file not written: %v", err)
-	}
-	var cfg map[string]any
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("invalid JSON: %v\n%s", err, data)
-	}
-
-	// OpenClaw reads root-level mcpServers for stdio server definitions.
-	servers, ok := cfg["mcpServers"].(map[string]any)
-	if !ok {
-		t.Fatal("mcpServers not found — OpenClaw reads root-level mcpServers for stdio servers")
-	}
-	muninn, ok := servers["muninn"].(map[string]any)
-	if !ok {
-		t.Fatal("mcpServers.muninn not found")
-	}
-	if muninn["command"] != "muninn" {
-		t.Errorf("command = %v, want \"muninn\"", muninn["command"])
-	}
-	args, ok := muninn["args"].([]any)
-	if !ok || len(args) != 1 || args[0] != "mcp" {
-		t.Errorf("args = %v, want [\"mcp\"]", muninn["args"])
-	}
-	if muninn["transport"] != "stdio" {
-		t.Errorf("transport = %v, want \"stdio\"", muninn["transport"])
-	}
-	// Token must not be embedded — proxy reads it at runtime.
-	if _, ok := muninn["headers"]; ok {
-		t.Error("headers must not be embedded in stdio config entry")
-	}
-	if !strings.Contains(out, "✓") || !strings.Contains(out, "OpenClaw") {
-		t.Errorf("output missing success marker: %s", out)
-	}
-	if !strings.Contains(out, "Restart OpenClaw") {
-		t.Errorf("output missing restart hint: %s", out)
-	}
-}
-
-func TestConfigureOpenClaw_NoToken(t *testing.T) {
-	_, cleanup := withTempHome(t)
-	defer cleanup()
-
-	captureStdout(func() {
-		configureOpenClaw("http://127.0.0.1:8750/mcp", "")
-	})
-
-	data, _ := os.ReadFile(openClawConfigPath())
-	var cfg map[string]any
-	json.Unmarshal(data, &cfg)
-	muninn := cfg["mcpServers"].(map[string]any)["muninn"].(map[string]any)
-	if muninn["transport"] != "stdio" {
-		t.Errorf("transport must be stdio, got %v", muninn["transport"])
-	}
-	if _, ok := muninn["headers"]; ok {
-		t.Error("headers must not be present in stdio config")
-	}
-}
-
-func TestConfigureOpenClaw_PreservesExistingEntries(t *testing.T) {
+func TestCleanupOpenClawBadConfig_RemovesMuninnEntry(t *testing.T) {
 	_, cleanup := withTempHome(t)
 	defer cleanup()
 
 	path := openClawConfigPath()
 	os.MkdirAll(filepath.Dir(path), 0755)
-	os.WriteFile(path, []byte(`{"mcpServers":{"other":{"command":"other","transport":"stdio"}},"topKey":"kept"}`), 0644)
+	// Simulate the broken v0.3.13-alpha config.
+	os.WriteFile(path, []byte(`{"provider":{"mcpServers":{"muninn":{"transport":"streamable-http","url":"http://127.0.0.1:8750/mcp"}}},"topKey":"kept"}`), 0644)
 
-	captureStdout(func() {
-		configureOpenClaw("http://127.0.0.1:8750/mcp", "tok")
-	})
+	cleanupOpenClawBadConfig()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("config file missing after cleanup: %v", err)
+	}
+	var cfg map[string]any
+	json.Unmarshal(data, &cfg)
+	if _, ok := cfg["provider"]; ok {
+		t.Error("provider key should be removed when mcpServers.muninn was the only entry")
+	}
+	if cfg["topKey"] != "kept" {
+		t.Error("unrelated top-level key must be preserved")
+	}
+}
+
+func TestCleanupOpenClawBadConfig_PreservesOtherServers(t *testing.T) {
+	_, cleanup := withTempHome(t)
+	defer cleanup()
+
+	path := openClawConfigPath()
+	os.MkdirAll(filepath.Dir(path), 0755)
+	os.WriteFile(path, []byte(`{"provider":{"mcpServers":{"muninn":{"transport":"streamable-http"},"other":{"transport":"streamable-http","url":"http://x"}}}}`), 0644)
+
+	cleanupOpenClawBadConfig()
 
 	data, _ := os.ReadFile(path)
 	var cfg map[string]any
 	json.Unmarshal(data, &cfg)
-	if cfg["topKey"] != "kept" {
-		t.Error("top-level key lost")
+	provider, ok := cfg["provider"].(map[string]any)
+	if !ok {
+		t.Fatal("provider key removed unexpectedly")
 	}
-	servers := cfg["mcpServers"].(map[string]any)
+	servers := provider["mcpServers"].(map[string]any)
+	if _, ok := servers["muninn"]; ok {
+		t.Error("muninn entry should be removed")
+	}
 	if _, ok := servers["other"]; !ok {
-		t.Error("other tool removed")
-	}
-	if _, ok := servers["muninn"]; !ok {
-		t.Error("muninn not added")
+		t.Error("other server entry must be preserved")
 	}
 }
 
-func TestConfigureOpenClaw_SummaryAdded(t *testing.T) {
+func TestCleanupOpenClawBadConfig_NoopWhenClean(t *testing.T) {
 	_, cleanup := withTempHome(t)
 	defer cleanup()
-	out := captureStdout(func() { configureOpenClaw("http://127.0.0.1:8750/mcp", "tok") })
-	if !strings.Contains(out, "added") {
-		t.Errorf("expected 'added' in output for new config: %s", out)
-	}
-}
-
-func TestConfigureOpenClaw_SummaryUpdated(t *testing.T) {
-	_, cleanup := withTempHome(t)
-	defer cleanup()
-	path := openClawConfigPath()
-	os.MkdirAll(filepath.Dir(path), 0755)
-	os.WriteFile(path, []byte(`{"mcpServers":{"muninn":{"command":"muninn","args":["mcp"],"transport":"stdio"}}}`), 0644)
-	out := captureStdout(func() { configureOpenClaw("http://127.0.0.1:8750/mcp", "tok") })
-	if !strings.Contains(out, "updated") {
-		t.Errorf("expected 'updated' in output for existing mcpServers: %s", out)
+	// No file — should not error or create anything.
+	cleanupOpenClawBadConfig()
+	if _, err := os.ReadFile(openClawConfigPath()); err == nil {
+		t.Error("cleanup should not create openclaw.json when it doesn't exist")
 	}
 }
 
@@ -562,7 +453,7 @@ func TestConfigureOpenClawSkill_WritesFile(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		if err := configureOpenClawSkill(); err != nil {
+		if err := configureOpenClawSkill(""); err != nil {
 			t.Fatalf("configureOpenClawSkill: %v", err)
 		}
 	})
@@ -574,8 +465,8 @@ func TestConfigureOpenClawSkill_WritesFile(t *testing.T) {
 	if !strings.Contains(string(data), "MuninnDB") {
 		t.Error("SKILL.md should mention MuninnDB")
 	}
-	if !strings.Contains(string(data), "muninn_remember") {
-		t.Error("SKILL.md should mention muninn_remember tool")
+	if !strings.Contains(string(data), "/api/engrams") {
+		t.Error("SKILL.md should mention the REST API engrams endpoint")
 	}
 	if !strings.Contains(out, "SKILL.md") {
 		t.Errorf("output should mention SKILL.md: %s", out)
@@ -592,7 +483,7 @@ func TestConfigureOpenClawSkill_CreatesDirectory(t *testing.T) {
 	}
 
 	captureStdout(func() {
-		if err := configureOpenClawSkill(); err != nil {
+		if err := configureOpenClawSkill(""); err != nil {
 			t.Fatalf("configureOpenClawSkill: %v", err)
 		}
 	})
@@ -973,43 +864,27 @@ func TestConfigureWindsurfWritesConfig(t *testing.T) {
 	}
 }
 
-// TestConfigureOpenClawWritesConfig verifies OpenClaw config is written at the correct path
-// with the correct stdio schema (root-level mcpServers with command/args/transport).
-func TestConfigureOpenClawWritesConfig(t *testing.T) {
-	_, cleanup := withTempHome(t)
-	defer cleanup()
 
-	out := captureStdout(func() {
-		if err := configureOpenClaw("http://127.0.0.1:8750/mcp", "tok"); err != nil {
-			t.Fatalf("error: %v", err)
-		}
-	})
-
-	data, err := os.ReadFile(openClawConfigPath())
-	if err != nil {
-		t.Fatalf("file not written: %v", err)
+// TestOpenClawSkillHasFrontmatter verifies the SKILL.md content includes valid YAML frontmatter
+// so that OpenClaw recognizes and loads the skill.
+func TestOpenClawSkillHasFrontmatter(t *testing.T) {
+	if !strings.HasPrefix(buildOpenClawSkillContent(""), "---\n") {
+		t.Error("SKILL.md must start with YAML frontmatter delimiter ---")
 	}
-	var cfg map[string]any
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
+	if !strings.Contains(buildOpenClawSkillContent(""), "name:") {
+		t.Error("SKILL.md frontmatter must include name field")
 	}
-	// OpenClaw reads root-level mcpServers for stdio server definitions.
-	servers, ok := cfg["mcpServers"].(map[string]any)
-	if !ok {
-		t.Fatalf("mcpServers not found in config: %s", data)
+	if !strings.Contains(buildOpenClawSkillContent(""), "description:") {
+		t.Error("SKILL.md frontmatter must include description field")
 	}
-	muninn, ok := servers["muninn"].(map[string]any)
-	if !ok {
-		t.Fatalf("mcpServers.muninn not found: %s", data)
+	if !strings.Contains(buildOpenClawSkillContent(""), "metadata:") {
+		t.Error("SKILL.md frontmatter must include metadata section")
 	}
-	if muninn["command"] != "muninn" {
-		t.Errorf("command = %v, want \"muninn\"", muninn["command"])
+	if !strings.Contains(buildOpenClawSkillContent(""), "bins:") {
+		t.Error("SKILL.md frontmatter must include requires.bins")
 	}
-	if muninn["transport"] != "stdio" {
-		t.Errorf("transport = %v, want \"stdio\"", muninn["transport"])
-	}
-	if !strings.Contains(out, "✓") {
-		t.Errorf("output missing success marker: %s", out)
+	if !strings.Contains(buildOpenClawSkillContent(""), "- curl") {
+		t.Error("SKILL.md frontmatter requires.bins must list curl (REST API uses curl)")
 	}
 }
 
@@ -1153,7 +1028,7 @@ func TestConfigureNamedToolsCodex(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"codex"}, "http://127.0.0.1:8750/mcp", "tok123")
+		configureNamedTools([]string{"codex"}, "http://127.0.0.1:8750/mcp", "tok123", "")
 	})
 	if !strings.Contains(out, "✓") {
 		t.Errorf("expected success marker for codex tool, got: %s", out)
@@ -1237,7 +1112,7 @@ func TestConfigureNamedToolsClaudeDesktop(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"claude"}, "http://127.0.0.1:8750/mcp", "tok123")
+		configureNamedTools([]string{"claude"}, "http://127.0.0.1:8750/mcp", "tok123", "")
 	})
 	if !strings.Contains(out, "✓") {
 		t.Errorf("expected success marker for claude tool, got: %s", out)
@@ -1256,7 +1131,7 @@ func TestConfigureNamedToolsClaudeDesktopAlias(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"claude-desktop"}, "http://127.0.0.1:8750/mcp", "tok")
+		configureNamedTools([]string{"claude-desktop"}, "http://127.0.0.1:8750/mcp", "tok", "")
 	})
 	if !strings.Contains(out, "✓") {
 		t.Errorf("claude-desktop alias should work: %s", out)
@@ -1269,7 +1144,7 @@ func TestConfigureNamedToolsCursor(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"cursor"}, "http://127.0.0.1:8750/mcp", "tok123")
+		configureNamedTools([]string{"cursor"}, "http://127.0.0.1:8750/mcp", "tok123", "")
 	})
 	if !strings.Contains(out, "✓") {
 		t.Errorf("expected success marker for cursor tool, got: %s", out)
@@ -1287,7 +1162,7 @@ func TestConfigureNamedToolsWindsurf(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"windsurf"}, "http://127.0.0.1:8750/mcp", "tok123")
+		configureNamedTools([]string{"windsurf"}, "http://127.0.0.1:8750/mcp", "tok123", "")
 	})
 	if !strings.Contains(out, "✓") {
 		t.Errorf("expected success marker for windsurf tool, got: %s", out)
@@ -1299,21 +1174,26 @@ func TestConfigureNamedToolsWindsurf(t *testing.T) {
 	}
 }
 
-// TestConfigureNamedToolsOpenClaw verifies openclaw tool configures OpenClaw.
+// TestConfigureNamedToolsOpenClaw verifies openclaw tool installs the SKILL.md
+// and does NOT write to openclaw.json (OpenClaw has no native MCP support).
 func TestConfigureNamedToolsOpenClaw(t *testing.T) {
 	_, cleanup := withTempHome(t)
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"openclaw"}, "http://127.0.0.1:8750/mcp", "tok123")
+		configureNamedTools([]string{"openclaw"}, "http://127.0.0.1:8750/mcp", "tok123", "")
 	})
 	if !strings.Contains(out, "✓") {
 		t.Errorf("expected success marker for openclaw tool, got: %s", out)
 	}
 
-	path := openClawConfigPath()
-	if _, err := os.ReadFile(path); err != nil {
-		t.Errorf("openclaw config file not written: %v", err)
+	// SKILL.md must be written.
+	if _, err := os.ReadFile(openClawSkillPath()); err != nil {
+		t.Errorf("SKILL.md not written: %v", err)
+	}
+	// openclaw.json must NOT be written — provider is not a valid OpenClaw key.
+	if _, err := os.ReadFile(openClawConfigPath()); err == nil {
+		t.Error("openclaw.json should not be written; OpenClaw has no native MCP support")
 	}
 }
 
@@ -1323,7 +1203,7 @@ func TestConfigureNamedToolsVSCode(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"vscode"}, "http://127.0.0.1:8750/mcp", "")
+		configureNamedTools([]string{"vscode"}, "http://127.0.0.1:8750/mcp", "", "")
 	})
 	if !strings.Contains(out, "VS Code") {
 		t.Errorf("expected VS Code instructions, got: %s", out)
@@ -1339,7 +1219,7 @@ func TestConfigureNamedToolsVSCodeAlias(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"vs-code"}, "http://127.0.0.1:8750/mcp", "")
+		configureNamedTools([]string{"vs-code"}, "http://127.0.0.1:8750/mcp", "", "")
 	})
 	if !strings.Contains(out, "VS Code") {
 		t.Errorf("expected VS Code instructions with vs-code alias: %s", out)
@@ -1352,7 +1232,7 @@ func TestConfigureNamedToolsManual(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"manual"}, "http://127.0.0.1:8750/mcp", "")
+		configureNamedTools([]string{"manual"}, "http://127.0.0.1:8750/mcp", "", "")
 	})
 	if !strings.Contains(out, "mcpServers") {
 		t.Errorf("expected manual instructions, got: %s", out)
@@ -1368,7 +1248,7 @@ func TestConfigureNamedToolsOtherAlias(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"other"}, "http://127.0.0.1:8750/mcp", "")
+		configureNamedTools([]string{"other"}, "http://127.0.0.1:8750/mcp", "", "")
 	})
 	if !strings.Contains(out, "mcpServers") {
 		t.Errorf("expected manual instructions with 'other' alias: %s", out)
@@ -1381,7 +1261,7 @@ func TestConfigureNamedToolsMultiple(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		configureNamedTools([]string{"claude", "cursor"}, "http://127.0.0.1:8750/mcp", "tok123")
+		configureNamedTools([]string{"claude", "cursor"}, "http://127.0.0.1:8750/mcp", "tok123", "")
 	})
 
 	// Both should succeed
@@ -1406,7 +1286,7 @@ func TestConfigureNamedToolsUnknownToolSetupAI(t *testing.T) {
 	defer cleanup()
 
 	stderr := captureStderr(func() {
-		configureNamedTools([]string{"nonexistent"}, "http://127.0.0.1:8750/mcp", "")
+		configureNamedTools([]string{"nonexistent"}, "http://127.0.0.1:8750/mcp", "", "")
 	})
 	if !strings.Contains(stderr, "unknown tool") {
 		t.Errorf("expected error for unknown tool, got stderr: %s", stderr)
@@ -1419,7 +1299,7 @@ func TestConfigureClaudeMD_NewFile(t *testing.T) {
 	defer cleanup()
 
 	out := captureStdout(func() {
-		if err := configureClaudeMD(); err != nil {
+		if err := configureClaudeMD(""); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -1461,7 +1341,7 @@ func TestConfigureClaudeMD_PrependsToExisting(t *testing.T) {
 	os.WriteFile(path, []byte(existing), 0644)
 
 	out := captureStdout(func() {
-		if err := configureClaudeMD(); err != nil {
+		if err := configureClaudeMD(""); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -1500,7 +1380,7 @@ func TestConfigureClaudeMD_AlreadyConfigured(t *testing.T) {
 	os.WriteFile(path, []byte(existing), 0644)
 
 	out := captureStdout(func() {
-		if err := configureClaudeMD(); err != nil {
+		if err := configureClaudeMD(""); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -1521,7 +1401,7 @@ func TestConfigureClaudeMD_CreatesDirectory(t *testing.T) {
 	defer cleanup()
 
 	captureStdout(func() {
-		if err := configureClaudeMD(); err != nil {
+		if err := configureClaudeMD(""); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -1571,5 +1451,84 @@ func TestClaudeMDPath(t *testing.T) {
 	path := claudeMDPath()
 	if !strings.HasSuffix(path, filepath.Join(".claude", "CLAUDE.md")) {
 		t.Errorf("unexpected path: %s", path)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Behavior mode content generation tests
+// ---------------------------------------------------------------------------
+
+// TestBuildClaudeMDMemoryBlock_ModeVariants verifies that each behavior mode
+// produces distinct, non-empty content with the correct proactivity instruction.
+func TestBuildClaudeMDMemoryBlock_ModeVariants(t *testing.T) {
+	cases := []struct {
+		mode   string
+		wantIn string
+	}{
+		{"autonomous", "proactive"},
+		{"prompted", "explicitly asks"},
+		{"selective", "Automatically store decisions"},
+		{"custom", "custom memory instructions"},
+		{"", "proactive"}, // empty = autonomous default
+	}
+	for _, tc := range cases {
+		got := buildClaudeMDMemoryBlock(tc.mode)
+		if !strings.Contains(got, "MuninnDB") {
+			t.Errorf("mode=%q: missing 'MuninnDB' in output", tc.mode)
+		}
+		if !strings.Contains(got, tc.wantIn) {
+			t.Errorf("mode=%q: expected %q in output, got:\n%s", tc.mode, tc.wantIn, got)
+		}
+	}
+	// Verify modes produce distinct outputs.
+	autonomous := buildClaudeMDMemoryBlock("autonomous")
+	prompted := buildClaudeMDMemoryBlock("prompted")
+	selective := buildClaudeMDMemoryBlock("selective")
+	if autonomous == prompted {
+		t.Error("autonomous and prompted should produce different CLAUDE.md blocks")
+	}
+	if autonomous == selective {
+		t.Error("autonomous and selective should produce different CLAUDE.md blocks")
+	}
+	if prompted == selective {
+		t.Error("prompted and selective should produce different CLAUDE.md blocks")
+	}
+}
+
+// TestBuildOpenClawSkillContent_ModeVariants verifies that each behavior mode
+// produces distinct usage pattern text in the SKILL.md content.
+func TestBuildOpenClawSkillContent_ModeVariants(t *testing.T) {
+	cases := []struct {
+		mode   string
+		wantIn string
+	}{
+		{"autonomous", "Be proactive"},
+		{"prompted", "ONLY store memories when the user explicitly asks"},
+		{"selective", "Automatically store"},
+		{"custom", "Be proactive"},   // custom falls through to proactive default
+		{"", "Be proactive"},
+	}
+	for _, tc := range cases {
+		got := buildOpenClawSkillContent(tc.mode)
+		if !strings.HasPrefix(got, "---\n") {
+			t.Errorf("mode=%q: must start with YAML frontmatter", tc.mode)
+		}
+		if !strings.Contains(got, tc.wantIn) {
+			t.Errorf("mode=%q: expected %q in output, got:\n%s", tc.mode, tc.wantIn, got)
+		}
+	}
+}
+
+// TestBuildOpenClawSkillContent_AllModesHaveUsagePattern verifies the ## Usage pattern
+// section is present for every mode.
+func TestBuildOpenClawSkillContent_AllModesHaveUsagePattern(t *testing.T) {
+	for _, mode := range []string{"", "autonomous", "prompted", "selective", "custom"} {
+		got := buildOpenClawSkillContent(mode)
+		if !strings.Contains(got, "## Usage pattern") {
+			t.Errorf("mode=%q: missing '## Usage pattern' section", mode)
+		}
+		if !strings.Contains(got, "/api/engrams") {
+			t.Errorf("mode=%q: missing REST API endpoint reference", mode)
+		}
 	}
 }

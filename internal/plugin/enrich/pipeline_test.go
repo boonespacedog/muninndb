@@ -2,6 +2,7 @@ package enrich
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -175,6 +176,9 @@ func TestPipelineRun_AllFail(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("expected error when all calls fail")
+	}
+	if !strings.Contains(err.Error(), "entities:") {
+		t.Fatalf("expected aggregated stage errors, got: %v", err)
 	}
 
 	if result != nil {
@@ -612,8 +616,41 @@ func TestFullModeBackwardCompat(t *testing.T) {
 	if len(result.Relationships) != 1 {
 		t.Fatalf("expected 1 relationship, got %d", len(result.Relationships))
 	}
-	if result.MemoryType != "tech_fact" {
-		t.Fatalf("expected type_label 'tech_fact', got %q", result.MemoryType)
+	if result.MemoryType != "fact" {
+		t.Fatalf("expected canonical memory_type 'fact', got %q", result.MemoryType)
+	}
+	if result.TypeLabel != "tech_fact" {
+		t.Fatalf("expected type_label 'tech_fact', got %q", result.TypeLabel)
+	}
+}
+
+// TestPipelineRun_AllStagesSkipped_ReturnsNothingToEnrich verifies that when all
+// pipeline stages are skipped because the engram already has inline data, the
+// pipeline returns ErrNothingToEnrich (not a generic error).
+func TestPipelineRun_AllStagesSkipped_ReturnsNothingToEnrich(t *testing.T) {
+	mock := NewMockLLMProvider()
+	limiter := NewTokenBucketLimiter(100.0, 100.0)
+	pipeline := NewPipeline(mock, limiter)
+
+	// Fully pre-enriched engram: all stages will be skipped.
+	eng := &storage.Engram{
+		ID:         storage.NewULID(),
+		Concept:    "pre-enriched",
+		Content:    "already has everything",
+		Summary:    "existing summary",
+		KeyPoints:  []string{"kp1"},
+		MemoryType: storage.TypeDecision,
+	}
+
+	result, err := pipeline.Run(context.Background(), eng)
+	if !errors.Is(err, ErrNothingToEnrich) {
+		t.Fatalf("expected ErrNothingToEnrich, got: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("expected nil result, got: %+v", result)
+	}
+	if mock.callCount != 0 {
+		t.Fatalf("expected 0 LLM calls, got %d", mock.callCount)
 	}
 }
 

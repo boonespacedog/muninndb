@@ -53,9 +53,10 @@ const (
 	ErrWeightsInvalid       = mbp.ErrWeightsInvalid
 	ErrAuthFailed           = mbp.ErrAuthFailed
 	ErrVaultForbidden       = mbp.ErrVaultForbidden
-	ErrRateLimited          = mbp.ErrRateLimited
-	ErrMaxResultsExceeded   = mbp.ErrMaxResultsExceeded
-	ErrStorageError         = mbp.ErrStorageError
+	ErrRateLimited           = mbp.ErrRateLimited
+	ErrMaxResultsExceeded    = mbp.ErrMaxResultsExceeded
+	ErrInvalidClusterRequest = mbp.ErrInvalidClusterRequest
+	ErrStorageError          = mbp.ErrStorageError
 	ErrIndexError           = mbp.ErrIndexError
 	ErrEnrichmentError      = mbp.ErrEnrichmentError
 	ErrShardUnavailable     = mbp.ErrShardUnavailable
@@ -136,6 +137,9 @@ type EngineAPI interface {
 	// ExportGraph builds the entity→relationship graph for the vault.
 	// If includeEngrams is true the entity types are enriched from the entity record table.
 	ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*engine.ExportGraph, error)
+	// EmbedStats returns the current stats for the embed retroactive processor.
+	// Returns a zero-value RetroactiveStats when no embed processor is registered.
+	EmbedStats() plugin.RetroactiveStats
 }
 
 // ── Web UI types ─────────────────────────────────────────────────────────
@@ -263,7 +267,8 @@ type DecideRequest struct {
 
 // DecideResponse is returned by the decide endpoint.
 type DecideResponse struct {
-	ID string `json:"id"`
+	ID       string   `json:"id"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // RestoreResponse is returned by the restore endpoint.

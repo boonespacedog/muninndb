@@ -79,7 +79,7 @@ class MuninnClient
         ], fn(mixed $v) => $v !== '' && $v !== [] && $v !== null);
 
         return WriteResponse::fromArray(
-            $this->request('POST', '/api/engrams', $body),
+            $this->request('POST', '/api/engrams?vault=' . urlencode($vault), $body),
         );
     }
 
@@ -96,7 +96,7 @@ class MuninnClient
         }, $engrams);
 
         return BatchWriteResponse::fromArray(
-            $this->request('POST', '/api/engrams/batch', ['engrams' => $prepared]),
+            $this->request('POST', '/api/engrams/batch?vault=' . urlencode($vault), ['engrams' => $prepared]),
         );
     }
 
@@ -127,36 +127,46 @@ class MuninnClient
         array $context,
         string $vault = 'default',
         float $threshold = 0.0,
-        int $limit = 10,
+        int $maxResults = 10,
         int $maxHops = 0,
         string $profile = '',
         string $mode = '',
         ?string $since = null,
         ?string $before = null,
         bool $includeWhy = false,
-        bool $briefMode = false,
+        string $briefMode = '',
     ): ActivateResponse {
-        $body = array_filter([
+        // Always-present fields (threshold=0.0 is a valid value, must not be dropped).
+        $body = [
             'vault'       => $vault,
             'context'     => $context,
             'threshold'   => $threshold,
-            'limit'       => $limit,
-            'max_hops'    => $maxHops,
-            'profile'     => $profile,
-            'mode'        => $mode,
-            'since'       => $since,
-            'before'      => $before,
-            'include_why' => $includeWhy,
-            'brief_mode'  => $briefMode,
-        ], fn(mixed $v) => $v !== '' && $v !== 0 && $v !== 0.0 && $v !== false && $v !== null);
-
-        // These fields must always be present
-        $body['vault']   = $vault;
-        $body['context'] = $context;
-        $body['limit']   = $limit;
+            'max_results' => $maxResults,
+        ];
+        if ($maxHops > 0) {
+            $body['max_hops'] = $maxHops;
+        }
+        if ($profile !== '') {
+            $body['profile'] = $profile;
+        }
+        if ($mode !== '') {
+            $body['mode'] = $mode;
+        }
+        if ($since !== null) {
+            $body['since'] = $since;
+        }
+        if ($before !== null) {
+            $body['before'] = $before;
+        }
+        if ($includeWhy) {
+            $body['include_why'] = true;
+        }
+        if ($briefMode !== '') {
+            $body['brief_mode'] = $briefMode;
+        }
 
         return ActivateResponse::fromArray(
-            $this->request('POST', '/api/activate', $body),
+            $this->request('POST', '/api/activate?vault=' . urlencode($vault), $body),
         );
     }
 
@@ -164,11 +174,11 @@ class MuninnClient
     public function link(
         string $sourceId,
         string $targetId,
-        string $relType = 'related',
+        int $relType = 1,
         float $weight = 1.0,
         string $vault = 'default',
     ): void {
-        $this->request('POST', '/api/link', [
+        $this->request('POST', '/api/link?vault=' . urlencode($vault), [
             'vault'     => $vault,
             'source_id' => $sourceId,
             'target_id' => $targetId,
@@ -183,7 +193,7 @@ class MuninnClient
     public function evolve(string $id, string $newContent, string $reason, string $vault = 'default'): EvolveResponse
     {
         return EvolveResponse::fromArray(
-            $this->request('POST', "/api/engrams/$id/evolve", [
+            $this->request('POST', "/api/engrams/$id/evolve?vault=" . urlencode($vault), [
                 'new_content' => $newContent,
                 'reason'      => $reason,
                 'vault'       => $vault,
@@ -199,7 +209,7 @@ class MuninnClient
     public function consolidate(array $ids, string $mergedContent, string $vault = 'default'): ConsolidateResponse
     {
         return ConsolidateResponse::fromArray(
-            $this->request('POST', '/api/consolidate', [
+            $this->request('POST', '/api/consolidate?vault=' . urlencode($vault), [
                 'vault'          => $vault,
                 'ids'            => $ids,
                 'merged_content' => $mergedContent,
@@ -221,7 +231,7 @@ class MuninnClient
         string $vault = 'default',
     ): DecideResponse {
         return DecideResponse::fromArray(
-            $this->request('POST', '/api/decide', array_filter([
+            $this->request('POST', '/api/decide?vault=' . urlencode($vault), array_filter([
                 'vault'        => $vault,
                 'decision'     => $decision,
                 'rationale'    => $rationale,
@@ -235,7 +245,7 @@ class MuninnClient
     public function restore(string $id, string $vault = 'default'): RestoreResponse
     {
         return RestoreResponse::fromArray(
-            $this->request('POST', "/api/engrams/$id/restore", ['vault' => $vault]),
+            $this->request('POST', "/api/engrams/$id/restore?vault=" . urlencode($vault), ['vault' => $vault]),
         );
     }
 
@@ -249,16 +259,24 @@ class MuninnClient
         int $maxHops = 2,
         int $maxNodes = 20,
         array $relTypes = [],
+        bool $followEntities = false,
         string $vault = 'default',
     ): TraverseResponse {
+        $body = [
+            'vault'     => $vault,
+            'start_id'  => $startId,
+            'max_hops'  => $maxHops,
+            'max_nodes' => $maxNodes,
+        ];
+        if ($relTypes !== []) {
+            $body['rel_types'] = $relTypes;
+        }
+        if ($followEntities) {
+            $body['follow_entities'] = true;
+        }
+
         return TraverseResponse::fromArray(
-            $this->request('POST', '/api/traverse', array_filter([
-                'vault'     => $vault,
-                'start_id'  => $startId,
-                'max_hops'  => $maxHops,
-                'max_nodes' => $maxNodes,
-                'rel_types' => $relTypes,
-            ], fn(mixed $v) => $v !== [])),
+            $this->request('POST', '/api/traverse?vault=' . urlencode($vault), $body),
         );
     }
 
@@ -270,7 +288,7 @@ class MuninnClient
     public function explain(string $engramId, array $query, string $vault = 'default'): ExplainResponse
     {
         return ExplainResponse::fromArray(
-            $this->request('POST', '/api/explain', [
+            $this->request('POST', '/api/explain?vault=' . urlencode($vault), [
                 'vault'     => $vault,
                 'engram_id' => $engramId,
                 'query'     => $query,
@@ -287,7 +305,7 @@ class MuninnClient
         }
 
         return SetStateResponse::fromArray(
-            $this->request('PUT', "/api/engrams/$id/state", $body),
+            $this->request('PUT', "/api/engrams/$id/state?vault=" . urlencode($vault), $body),
         );
     }
 
@@ -303,7 +321,7 @@ class MuninnClient
     public function retryEnrich(string $id, string $vault = 'default'): RetryEnrichResponse
     {
         return RetryEnrichResponse::fromArray(
-            $this->request('POST', "/api/engrams/$id/retry-enrich", ['vault' => $vault]),
+            $this->request('POST', "/api/engrams/$id/retry-enrich?vault=" . urlencode($vault), ['vault' => $vault]),
         );
     }
 

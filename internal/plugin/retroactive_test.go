@@ -5,10 +5,12 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/pebble"
 )
 
 // ---------------------------------------------------------------------------
-// Enrichment-capable mock for processEngram tests
+// Enrichment-capable mock for processEnrichEngram tests
 // ---------------------------------------------------------------------------
 
 type enrichMockForRetro struct {
@@ -175,7 +177,7 @@ func TestRetroactiveProcessor_ProcessBatchNilIterator(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// processBatch — enrich path (processEngram)
+// processBatch — enrich path (processEnrichEngram)
 // ---------------------------------------------------------------------------
 
 func TestRetroactiveProcessor_ProcessBatchEnrich(t *testing.T) {
@@ -287,7 +289,7 @@ func TestRetroactiveProcessor_ProcessBatchEmbedUpdateError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// processBatch — enrich processEngram error
+// processBatch — enrich processEnrichEngram error
 // ---------------------------------------------------------------------------
 
 func TestRetroactiveProcessor_ProcessBatchEnrichError(t *testing.T) {
@@ -309,6 +311,63 @@ func TestRetroactiveProcessor_ProcessBatchEnrichError(t *testing.T) {
 	stats := rp.Stats()
 	if stats.Errors != 1 {
 		t.Errorf("expected Errors=1, got %d", stats.Errors)
+	}
+}
+
+func TestRetroactiveProcessor_ProcessBatchEnrichNilResult(t *testing.T) {
+	eng := &Engram{Concept: "nil", Content: "content"}
+	iter := &mockIterator{engrams: []*Engram{eng}}
+
+	store := &mockPluginStore{countResult: 1, scanResult: iter}
+	enrichPlugin := &enrichMockForRetro{
+		mockPlugin: mockPlugin{name: "enrich-nil", tier: TierEnrich},
+	}
+	rp := NewRetroactiveProcessor(store, enrichPlugin, DigestEnrich)
+
+	ok := rp.processBatch(context.Background())
+	if !ok {
+		t.Error("processBatch should return true even with enrich errors")
+	}
+
+	stats := rp.Stats()
+	if stats.Errors != 1 {
+		t.Errorf("expected Errors=1, got %d", stats.Errors)
+	}
+	if store.setFlagCalls != 0 {
+		t.Errorf("expected no digest flags to be set on nil result, got %d calls", store.setFlagCalls)
+	}
+}
+
+func TestRetroactiveProcessor_ProcessBatchEntityPersistenceError(t *testing.T) {
+	eng := &Engram{Concept: "retry", Content: "uses postgres"}
+	iter := &mockIterator{engrams: []*Engram{eng}}
+
+	store := &mockPluginStore{
+		countResult: 1,
+		scanResult:  iter,
+		linkErr:     errors.New("link fail"),
+	}
+	enrichPlugin := &enrichMockForRetro{
+		mockPlugin: mockPlugin{name: "enrich-entity-fail", tier: TierEnrich},
+		enrichResult: &EnrichmentResult{
+			Entities: []ExtractedEntity{
+				{Name: "postgres", Type: "database", Confidence: 0.9},
+			},
+		},
+	}
+	rp := NewRetroactiveProcessor(store, enrichPlugin, DigestEnrich)
+
+	ok := rp.processBatch(context.Background())
+	if !ok {
+		t.Error("processBatch should return true even with enrich errors")
+	}
+
+	stats := rp.Stats()
+	if stats.Errors != 1 {
+		t.Errorf("expected Errors=1, got %d", stats.Errors)
+	}
+	if store.setFlagCalls != 0 {
+		t.Errorf("expected no digest flags to be set on entity persistence failure, got %v", store.setFlags)
 	}
 }
 
@@ -366,51 +425,26 @@ func TestRetroactiveProcessor_ProcessBatchCancelled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// processEngram — plain plugin (not embed, not enrich) → no-op
+// processEnrichEngram — plain plugin (not embed, not enrich) → no-op
 // ---------------------------------------------------------------------------
 
-func TestRetroactiveProcessor_ProcessEngramPlainPlugin(t *testing.T) {
+func TestRetroactiveProcessor_ProcessEnrichEngramPlainPlugin(t *testing.T) {
 	store := &mockPluginStore{}
 	p := &mockPlugin{name: "plain", tier: TierEmbed}
 	rp := NewRetroactiveProcessor(store, p, DigestEmbed)
 
 	eng := &Engram{Concept: "x", Content: "y"}
-	err := rp.processEngram(context.Background(), eng)
+	err := rp.processEnrichEngram(context.Background(), eng)
 	if err != nil {
-		t.Errorf("processEngram plain should return nil, got %v", err)
+		t.Errorf("processEnrichEngram plain should return nil, got %v", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// processEngram — embed path
+// processEnrichEngram — enrich path
 // ---------------------------------------------------------------------------
 
-func TestRetroactiveProcessor_ProcessEngramEmbed(t *testing.T) {
-	store := &mockPluginStore{}
-	p := &mockEmbedPlugin{mockPlugin: mockPlugin{name: "pe", tier: TierEmbed}}
-	rp := NewRetroactiveProcessor(store, p, DigestEmbed)
-
-	eng := &Engram{Concept: "hello", Content: "world"}
-	err := rp.processEngram(context.Background(), eng)
-	if err != nil {
-		t.Errorf("processEngram embed should succeed, got %v", err)
-	}
-	if store.updateEmbedCalls != 1 {
-		t.Errorf("expected 1 UpdateEmbedding call, got %d", store.updateEmbedCalls)
-	}
-	if store.hnswInsertCalls != 1 {
-		t.Errorf("expected 1 HNSWInsert call, got %d", store.hnswInsertCalls)
-	}
-	if store.autoLinkCalls != 1 {
-		t.Errorf("expected 1 AutoLinkByEmbedding call, got %d", store.autoLinkCalls)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// processEngram — enrich path
-// ---------------------------------------------------------------------------
-
-func TestRetroactiveProcessor_ProcessEngramEnrich(t *testing.T) {
+func TestRetroactiveProcessor_ProcessEnrichEngramEnrich(t *testing.T) {
 	store := &mockPluginStore{}
 	p := &enrichMockForRetro{
 		mockPlugin:   mockPlugin{name: "pe-enrich", tier: TierEnrich},
@@ -419,25 +453,9 @@ func TestRetroactiveProcessor_ProcessEngramEnrich(t *testing.T) {
 	rp := NewRetroactiveProcessor(store, p, DigestEnrich)
 
 	eng := &Engram{Concept: "hello", Content: "world"}
-	err := rp.processEngram(context.Background(), eng)
+	err := rp.processEnrichEngram(context.Background(), eng)
 	if err != nil {
-		t.Errorf("processEngram enrich should succeed, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// processEngram — embed errors propagate
-// ---------------------------------------------------------------------------
-
-func TestRetroactiveProcessor_ProcessEngramEmbedError(t *testing.T) {
-	store := &mockPluginStore{updateEmbedErr: errors.New("store fail")}
-	p := &mockEmbedPlugin{mockPlugin: mockPlugin{name: "ee", tier: TierEmbed}}
-	rp := NewRetroactiveProcessor(store, p, DigestEmbed)
-
-	eng := &Engram{Concept: "a", Content: "b"}
-	err := rp.processEngram(context.Background(), eng)
-	if err == nil {
-		t.Error("expected error from UpdateEmbedding failure")
+		t.Errorf("processEnrichEngram enrich should succeed, got %v", err)
 	}
 }
 
@@ -503,11 +521,11 @@ func TestRetroactiveProcessor_NotifyWakeup(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// processEngram — DigestEntities flag suppresses UpsertEntity calls
+// processEnrichEngram — DigestEntities flag suppresses UpsertEntity calls
 // ---------------------------------------------------------------------------
 
 // TestRetroactiveProcessor_DigestEntitiesFlagSkipsUpsert verifies the core bug fix:
-// when the DigestEntities flag is already set on an engram, processEngram must NOT
+// when the DigestEntities flag is already set on an engram, processEnrichEngram must NOT
 // call UpsertEntity. Previously, hasEntities was derived from len(KeyPoints) > 0,
 // which incorrectly conflated summarization key points with entity extraction.
 // After the fix, GetDigestFlags is the authoritative source.
@@ -539,9 +557,9 @@ func TestRetroactiveProcessor_DigestEntitiesFlagSkipsUpsert(t *testing.T) {
 	}
 	rp := NewRetroactiveProcessor(store, enrichPlugin, DigestEnrich)
 
-	err := rp.processEngram(context.Background(), eng)
+	err := rp.processEnrichEngram(context.Background(), eng)
 	if err != nil {
-		t.Fatalf("processEngram should succeed, got %v", err)
+		t.Fatalf("processEnrichEngram should succeed, got %v", err)
 	}
 
 	// UpsertEntity must NOT have been called because DigestEntities flag was set.
@@ -578,9 +596,9 @@ func TestRetroactiveProcessor_NoDigestEntitiesFlagCallsUpsert(t *testing.T) {
 	}
 	rp := NewRetroactiveProcessor(store, enrichPlugin, DigestEnrich)
 
-	err := rp.processEngram(context.Background(), eng)
+	err := rp.processEnrichEngram(context.Background(), eng)
 	if err != nil {
-		t.Fatalf("processEngram should succeed, got %v", err)
+		t.Fatalf("processEnrichEngram should succeed, got %v", err)
 	}
 
 	// UpsertEntity MUST be called once per entity when flag is not set.
@@ -618,9 +636,9 @@ func TestRetroactiveProcessor_KeyPointsAloneDoNotSkipEntities(t *testing.T) {
 	}
 	rp := NewRetroactiveProcessor(store, enrichPlugin, DigestEnrich)
 
-	err := rp.processEngram(context.Background(), eng)
+	err := rp.processEnrichEngram(context.Background(), eng)
 	if err != nil {
-		t.Fatalf("processEngram should succeed, got %v", err)
+		t.Fatalf("processEnrichEngram should succeed, got %v", err)
 	}
 
 	// Even though KeyPoints is non-empty, entities must be upserted because
@@ -628,6 +646,104 @@ func TestRetroactiveProcessor_KeyPointsAloneDoNotSkipEntities(t *testing.T) {
 	if store.upsertEntityCalls != 1 {
 		t.Errorf("expected 1 UpsertEntity call (KeyPoints alone must not skip entities), got %d",
 			store.upsertEntityCalls)
+	}
+}
+
+func TestRetroactiveProcessor_MissingDigestFlagsDoNotSkipEngram(t *testing.T) {
+	eng := &Engram{Concept: "service", Content: "uses postgres"}
+	iter := &mockIterator{engrams: []*Engram{eng}}
+
+	store := &mockPluginStore{
+		countResult:    1,
+		scanResult:     iter,
+		getFlagsErr:    pebble.ErrNotFound,
+		getFlagsResult: 0,
+	}
+	enrichPlugin := &enrichMockForRetro{
+		mockPlugin: mockPlugin{name: "enrich-missing-flags", tier: TierEnrich},
+		enrichResult: &EnrichmentResult{
+			Summary: "summary",
+		},
+	}
+	rp := NewRetroactiveProcessor(store, enrichPlugin, DigestEnrich)
+
+	if err := rp.processEnrichEngram(context.Background(), eng); err != nil {
+		t.Fatalf("processEnrichEngram should succeed when digest flags are missing: %v", err)
+	}
+	if enrichPlugin.callCount != 1 {
+		t.Fatalf("expected enrich to run when digest flags are missing, got %d calls", enrichPlugin.callCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Progress rate/ETA tests
+// ---------------------------------------------------------------------------
+
+// TestRetroactiveProcessor_ProgressEvery100 verifies that RatePerSec is populated
+// after fewer than 1000 engrams are processed (i.e., after every micro-batch flush,
+// not only at the 1000-engram boundary).
+func TestRetroactiveProcessor_ProgressEvery100(t *testing.T) {
+	const n = 50 // fewer than 1000, so old code would never update rate
+
+	// Build n engrams for the mock iterator
+	engrams := make([]*Engram, n)
+	for i := range engrams {
+		engrams[i] = &Engram{Content: "text"}
+	}
+
+	store := &mockPluginStore{
+		countResult: int64(n),
+		scanResult:  &mockIterator{engrams: engrams},
+	}
+
+	// maxBatchSize=10 so flushMicroBatch fires after every 10 engrams
+	plugin := &mockEmbedPlugin{
+		mockPlugin: mockPlugin{name: "embed-test", tier: TierEmbed},
+	}
+
+	rp := NewRetroactiveProcessor(store, plugin, DigestEmbed)
+
+	// Sleep a tiny bit so elapsed > 0 during the rate calculation
+	time.Sleep(10 * time.Millisecond)
+
+	rp.processBatch(context.Background())
+
+	stats := rp.Stats()
+	if stats.RatePerSec <= 0 {
+		t.Errorf("expected RatePerSec > 0 after %d engrams, got %v (old code only updated at 1000)", n, stats.RatePerSec)
+	}
+}
+
+// TestRetroactiveProcessor_StaleRateReset verifies that RatePerSec and ETASeconds
+// are zeroed at the start of each processBatch pass so stale values from a prior
+// pass don't leak into the embed-status API response while the processor is idle.
+func TestRetroactiveProcessor_StaleRateReset(t *testing.T) {
+	store := &mockPluginStore{countResult: 0} // zero-work pass to trigger early-return path
+	plugin := &mockEmbedPlugin{
+		mockPlugin: mockPlugin{name: "embed-reset", tier: TierEmbed},
+	}
+
+	rp := NewRetroactiveProcessor(store, plugin, DigestEmbed)
+
+	// Seed non-zero rate/ETA to simulate stale values left over from a prior pass.
+	rp.statsMu.Lock()
+	rp.stats.RatePerSec = 99.9
+	rp.stats.ETASeconds = 9999
+	rp.statsMu.Unlock()
+
+	// processBatch must zero rate/ETA at the very start, before the count check.
+	rp.processBatch(context.Background())
+
+	rp.statsMu.RLock()
+	rate := rp.stats.RatePerSec
+	eta := rp.stats.ETASeconds
+	rp.statsMu.RUnlock()
+
+	if rate != 0 {
+		t.Errorf("expected RatePerSec=0 at new pass start, got %v", rate)
+	}
+	if eta != 0 {
+		t.Errorf("expected ETASeconds=0 at new pass start, got %v", eta)
 	}
 }
 

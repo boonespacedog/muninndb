@@ -1,14 +1,107 @@
 package auth_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/scrypster/muninndb/internal/auth"
 )
+
+func makeSessionToken(t *testing.T, secret []byte) string {
+	t.Helper()
+	token, err := auth.NewSessionToken("admin", secret)
+	if err != nil {
+		t.Fatalf("makeSessionToken: %v", err)
+	}
+	return token
+}
+
+func TestWriteOnlyFromContext(t *testing.T) {
+	tests := []struct {
+		mode string
+		want bool
+	}{
+		{"write", true},
+		{"full", false},
+		{"observe", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		ctx := context.WithValue(context.Background(), auth.ContextMode, tc.mode)
+		if got := auth.WriteOnlyFromContext(ctx); got != tc.want {
+			t.Errorf("mode=%q: WriteOnlyFromContext=%v, want %v", tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestWriteOnlyGuard_Blocks(t *testing.T) {
+	reached := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true })
+	handler := auth.WriteOnlyGuard(inner)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	ctx := context.WithValue(req.Context(), auth.ContextMode, "write")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req.WithContext(ctx))
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+	if reached {
+		t.Error("inner handler should not be called for write-only mode")
+	}
+}
+
+func TestWriteOnlyGuard_PassesThrough(t *testing.T) {
+	for _, mode := range []string{"full", "observe", ""} {
+		mode := mode
+		reached := false
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true })
+		handler := auth.WriteOnlyGuard(inner)
+
+		req := httptest.NewRequest("GET", "/", nil)
+		if mode != "" {
+			ctx := context.WithValue(req.Context(), auth.ContextMode, mode)
+			req = req.WithContext(ctx)
+		}
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+		if !reached {
+			t.Errorf("mode=%q: inner handler should be called", mode)
+		}
+	}
+}
+
+// Regression: after "write"→"full" change, admin session must still be able to read.
+func TestVaultAuthWithAdminBypass_SetsFullMode(t *testing.T) {
+	store := newTestStore(t)
+	secret := []byte("test-secret")
+
+	called := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		mode, _ := r.Context().Value(auth.ContextMode).(string)
+		if mode != "full" {
+			t.Errorf("admin session mode = %q, want %q", mode, "full")
+		}
+		if auth.WriteOnlyFromContext(r.Context()) {
+			t.Error("WriteOnlyFromContext must return false for admin session")
+		}
+	})
+
+	handler := store.VaultAuthWithAdminBypass(secret, inner)
+	req := httptest.NewRequest("GET", "/?vault=default", nil)
+	token := makeSessionToken(t, secret)
+	req.AddCookie(&http.Cookie{Name: "muninn_session", Value: token})
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if !called {
+		t.Error("inner handler was not called")
+	}
+}
 
 func newTestStore(t *testing.T) *auth.Store {
 	t.Helper()
@@ -306,5 +399,198 @@ func TestAuthMiddleware_VaultIsolation(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("key for vault-a accessing vault-b: expected 401, got %d", w.Code)
+	}
+}
+
+func TestAuthMiddleware_NonDefaultKeyRequiresExplicitVault(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "vault-a", Public: false})
+	token, _, err := s.GenerateAPIKey("vault-a", "agent", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("GET", "/api/engrams", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("missing explicit vault for non-default key: expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthMiddleware_ValidKey_BodyVault(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "vault-a", Public: false})
+	token, _, err := s.GenerateAPIKey("vault-a", "agent", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	var capturedVault string
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		capturedVault, _ = r.Context().Value(auth.ContextVault).(string)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/api/engrams", strings.NewReader(`{"vault":"vault-a","concept":"c","content":"body"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("body vault with matching key: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if capturedVault != "vault-a" {
+		t.Errorf("captured vault: want %q, got %q", "vault-a", capturedVault)
+	}
+}
+
+func TestAuthMiddleware_PublicVaultInBodyNoKey(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "public-vault", Public: true})
+
+	var capturedVault string
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		capturedVault, _ = r.Context().Value(auth.ContextVault).(string)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/api/activate", strings.NewReader(`{"vault":"public-vault","context":["hello"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("public body vault: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if capturedVault != "public-vault" {
+		t.Errorf("captured vault: want %q, got %q", "public-vault", capturedVault)
+	}
+}
+
+func TestAuthMiddleware_QueryBodyVaultMismatch(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "vault-a", Public: false})
+	token, _, err := s.GenerateAPIKey("vault-a", "agent", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/api/engrams?vault=vault-a", strings.NewReader(`{"vault":"vault-b","concept":"c","content":"body"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("query/body mismatch: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthMiddleware_BatchBodyVault(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "vault-a", Public: false})
+	token, _, err := s.GenerateAPIKey("vault-a", "agent", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	var capturedVault string
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		capturedVault, _ = r.Context().Value(auth.ContextVault).(string)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/api/engrams/batch", strings.NewReader(`{"engrams":[{"vault":"vault-a","concept":"c1","content":"body"},{"concept":"c2","content":"body"}]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch body vault with matching key: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if capturedVault != "vault-a" {
+		t.Errorf("captured vault: want %q, got %q", "vault-a", capturedVault)
+	}
+}
+
+func TestAuthMiddleware_BatchBodyMixedVaults(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "vault-a", Public: false})
+	token, _, err := s.GenerateAPIKey("vault-a", "agent", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/api/engrams/batch", strings.NewReader(`{"engrams":[{"vault":"vault-a","concept":"c1","content":"body"},{"vault":"vault-b","concept":"c2","content":"body"}]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("mixed batch body vaults: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthMiddleware_TextPlainJSONBodyVaultMismatch(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "vault-a", Public: false})
+	token, _, err := s.GenerateAPIKey("vault-a", "agent", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/api/engrams", strings.NewReader(`{"vault":"vault-b","concept":"c","content":"body"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "text/plain")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("text/plain JSON mismatch: expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthMiddleware_BatchBodyTopLevelVaultMismatch(t *testing.T) {
+	s := newTestStore(t)
+	s.SetVaultConfig(auth.VaultConfig{Name: "vault-a", Public: false})
+	token, _, err := s.GenerateAPIKey("vault-a", "agent", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("POST", "/api/engrams/batch", strings.NewReader(`{"vault":"vault-a","engrams":[{"vault":"vault-b","concept":"c1","content":"body"}]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("batch top-level mismatch: expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }

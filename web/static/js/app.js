@@ -64,9 +64,11 @@ document.addEventListener('alpine:init', () => {
     // Graph
     graphLoaded: false,
     graphTab: 'memory',
+    graphLabelMode: 'full', // 'full' | 'short' | 'none'
     _cy: null,
     entityGraphLoaded: false,
     entityGraphStatus: '',
+    entityGraphLabelMode: 'full',
     _entityCy: null,
 
     // Session
@@ -197,19 +199,20 @@ document.addEventListener('alpine:init', () => {
       embedApiKey: '',
       embedUrl: '',           // custom base URL for openai-compatible endpoints
       embedShowForm: false,
-      embedSaved: false,
       embedError: '',
       enrichProvider: 'none', // 'none' | 'ollama' | 'openai' | 'anthropic'
       enrichOllamaModel: 'llama3.2',
       enrichModel: 'claude-haiku-4-5-20251001',
       enrichApiKey: '',
       enrichShowForm: false,
-      enrichSaved: false,
       enrichError: '',
       ollamaModels: [],
       ollamaEmbedModels: [],
       ollamaDetected: null,   // null=unchecked, true=running, false=not found
       ollamaChecking: false,
+      embedRatePerSec: 0,       // from embed-status API: engrams/sec, 0 when idle
+      embedETASecs: 0,          // from embed-status API: seconds until complete, 0 when idle
+      embedHardwareGPU: null,   // null = unknown/cloud; true = GPU; false = CPU-only Ollama
     },
 
     // Vault actions
@@ -301,14 +304,22 @@ document.addEventListener('alpine:init', () => {
       try {
         const h = await fetch('/api/health').then(r => r.json());
         this.appVersion = h.version || '';
-      } catch (_) {}
+      } catch (err) {
+        console.warn('[muninn] health check failed:', err);
+      }
 
       // Load initial data (gated on auth check)
       await this.checkAuth();
 
-      // Fetch vault engram counts whenever the vault picker modal opens.
+      // Fetch vault list and engram counts whenever the vault picker modal opens.
+      // loadVaults() was previously missing here — the vault list would only
+      // refresh at login/auth-check, so newly created vaults wouldn't appear
+      // until page reload.
       this.$watch('vaultModalOpen', (open) => {
-        if (open) this.loadVaultStats();
+        if (open) {
+          this.loadVaults();
+          this.loadVaultStats();
+        }
       });
     },
 
@@ -373,7 +384,7 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
-    _onViewEnter(view) {
+    async _onViewEnter(view) {
       // Stop observability polling when leaving the tab
       if (this._obsInterval) {
         clearInterval(this._obsInterval);
@@ -414,6 +425,7 @@ document.addEventListener('alpine:init', () => {
         } else if (this.settingsTab === 'plugins') {
           this.loadPlugins();
           this.loadEmbedStatus();
+          await this.loadSavedPluginConfig();  // must resolve before probeOllama reads model state
           this.probeOllama();
         } else if (this.settingsTab === 'keys') {
           this.loadApiKeys();
@@ -500,21 +512,36 @@ document.addEventListener('alpine:init', () => {
         try {
           const msg = JSON.parse(e.data);
           this._handleLiveMessage(msg);
-        } catch (_) {}
+        } catch (err) {
+          console.warn('[muninn] failed to process live event:', err, e.data);
+        }
       };
+
+      es.addEventListener('error', (e) => {
+        // Connection-level errors have null data; onerror already handles those silently.
+        // Only process named 'event: error' server events (which carry non-null data).
+        if (!e.data) return;
+        let msg = 'Live feed error';
+        try {
+          const data = JSON.parse(e.data);
+          if (data.error) msg = 'Live feed: ' + data.error;
+        } catch (_) {}
+        console.warn('[muninn] SSE error event:', msg);
+        this.addNotification('error', msg);
+        this.liveConnected = false;
+        es.close();
+        this._es = null;
+        window._muninnSSE = null;
+        const delay = Math.min(500 * Math.pow(1.5, this._esRetries), 30000);
+        this._esRetries++;
+        setTimeout(() => this.connectLive(), delay);
+      });
 
       this._es = es;
     },
 
     _handleLiveMessage(msg) {
       if (msg.type === 'stats_update') {
-        const newCount = msg.data.engramCount || 0;
-
-        // Count-diff: if engrams increased, fetch newest as live feed entry
-        if (this._prevEngramCount > 0 && newCount > this._prevEngramCount) {
-          this._fetchNewestEngram();
-        }
-
         // Vault count-diff: refresh vault list when a vault is added or removed.
         // Guard with > 0 on first message (learn current count without triggering a reload).
         const newVaultCount = msg.data.vaultCount || 0;
@@ -527,32 +554,31 @@ document.addEventListener('alpine:init', () => {
         // the global broadcast values.
         this.loadStats();
       } else if (msg.type === 'memory_added') {
-        this.liveFeed.unshift(msg.data);
-        if (this.liveFeed.length > 20) this.liveFeed.pop();
-      }
-    },
-
-    async _fetchNewestEngram() {
-      try {
-        const data = await this.apiCall(
-          '/api/engrams?vault=' + encodeURIComponent(this.vault) + '&limit=1&offset=0'
-        );
-        const e = (data.engrams || [])[0];
-        if (e) {
-          this.liveFeed.unshift({
-            id: e.id,
-            concept: e.concept,
-            vault: e.vault || this.vault,
-            createdAt: e.created_at,
-          });
-          if (this.liveFeed.length > 20) this.liveFeed.pop();
+        // Guard: skip malformed events missing required fields.
+        // A missing or undefined id causes Alpine x-for to use 'undefined' as
+        // a key, corrupting DOM anchor tracking and producing the
+        // "can't access property 'after', v is undefined" crash that cascades
+        // to break the entire Alpine reactivity system.
+        if (!msg.data || !msg.data.id) {
+          console.warn('[muninn] live feed received memory_added with missing id — skipping', msg.data);
+          return;
         }
-      } catch (_) {}
+        // Deduplicate: guard against double-delivery of the same engram ID.
+        // Replace the array reference (instead of in-place unshift+pop) so that
+        // Alpine.js x-for can perform a clean diff — in-place mutations of both
+        // ends of the array confuse Alpine's DOM anchor tracking and produce the
+        // "can't access property 'after', v is undefined" crash.
+        if (!this.liveFeed.some(item => item.id === msg.data.id)) {
+          const next = [msg.data, ...this.liveFeed];
+          this.liveFeed = next.length > 20 ? next.slice(0, 20) : next;
+        }
+      }
     },
 
     // ── API helpers ────────────────────────────────────────────────────────
     async apiCall(url, opts = {}) {
       const res = await fetch(url, {
+        credentials: 'same-origin', // always send session cookie for admin endpoints
         headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
         ...opts,
       });
@@ -573,7 +599,6 @@ document.addEventListener('alpine:init', () => {
           storageBytes: data.storage_bytes  || data.storageBytes || 0,
           indexSize:    data.index_size     || data.indexSize    || 0,
         };
-        this._prevEngramCount = this.stats.engramCount;
       } catch (err) {
         this.addNotification('error', 'Stats: ' + err.message);
       }
@@ -588,7 +613,9 @@ document.addEventListener('alpine:init', () => {
           { name: 'Contradict',  state: data.contradict?.state ?? 0 },
           { name: 'Confidence',  state: data.confidence?.state ?? 0 },
         ];
-      } catch (_) {}
+      } catch (err) {
+        console.warn('[muninn] worker stats failed:', err);
+      }
     },
 
     workerStateName(state) {
@@ -749,13 +776,12 @@ document.addEventListener('alpine:init', () => {
         // ActivateRequest uses context:[]string, max_results:int
         const body = {
             context: [this.searchQuery.trim()],
-            vault: this.vault,
             max_results: 20,
         };
         if (this.searchMode && this.searchMode !== 'balanced') {
             body.mode = this.searchMode;
         }
-        const data = await this.apiCall('/api/activate', {
+        const data = await this.apiCall('/api/activate?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify(body),
         });
@@ -794,43 +820,36 @@ document.addEventListener('alpine:init', () => {
       try {
         if (action === 'keep_a') {
           // A supersedes B; archive B
-          await fetch('/api/link', {
+          await this.apiCall('/api/link?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ source_id: idA, target_id: idB, rel_type: 4, weight: 1.0, vault }),
+            body: JSON.stringify({ source_id: idA, target_id: idB, rel_type: 4, weight: 1.0 }),
           });
-          await fetch('/api/engrams/' + encodeURIComponent(idB) + '/state', {
+          await this.apiCall('/api/engrams/' + encodeURIComponent(idB) + '/state?vault=' + encodeURIComponent(vault), {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, state: 'archived' }),
+            body: JSON.stringify({ state: 'archived' }),
           });
-          await fetch('/api/admin/contradictions/resolve', {
+          await this.apiCall('/api/admin/contradictions/resolve?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, id_a: idA, id_b: idB }),
+            body: JSON.stringify({ id_a: idA, id_b: idB }),
           });
         } else if (action === 'keep_b') {
           // B supersedes A; archive A
-          await fetch('/api/link', {
+          await this.apiCall('/api/link?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ source_id: idB, target_id: idA, rel_type: 4, weight: 1.0, vault }),
+            body: JSON.stringify({ source_id: idB, target_id: idA, rel_type: 4, weight: 1.0 }),
           });
-          await fetch('/api/engrams/' + encodeURIComponent(idA) + '/state', {
+          await this.apiCall('/api/engrams/' + encodeURIComponent(idA) + '/state?vault=' + encodeURIComponent(vault), {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, state: 'archived' }),
+            body: JSON.stringify({ state: 'archived' }),
           });
-          await fetch('/api/admin/contradictions/resolve', {
+          await this.apiCall('/api/admin/contradictions/resolve?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, id_a: idA, id_b: idB }),
+            body: JSON.stringify({ id_a: idA, id_b: idB }),
           });
         } else if (action === 'dismiss') {
-          await fetch('/api/admin/contradictions/resolve', {
+          await this.apiCall('/api/admin/contradictions/resolve?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, id_a: idA, id_b: idB }),
+            body: JSON.stringify({ id_a: idA, id_b: idB }),
           });
         } else if (action === 'merge') {
           // Open consolidate modal pre-filled with both IDs
@@ -905,13 +924,12 @@ document.addEventListener('alpine:init', () => {
         : [];
       try {
         // POST /api/engrams → WriteRequest: { concept, content, tags, vault, confidence }
-        await this.apiCall('/api/engrams', {
+        await this.apiCall('/api/engrams?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
             concept: form.concept,
             content: form.content,
             tags,
-            vault: this.vault,
             confidence: parseFloat(form.confidence) || 0.8,
           }),
         });
@@ -992,10 +1010,10 @@ document.addEventListener('alpine:init', () => {
       this.editTagsSaving = true;
       try {
         const resp = await this.apiCall(
-          '/api/engrams/' + encodeURIComponent(this.selectedMemory.id) + '/tags',
+          '/api/engrams/' + encodeURIComponent(this.selectedMemory.id) + '/tags?vault=' + encodeURIComponent(this.vault),
           {
             method: 'PUT',
-            body: JSON.stringify({ vault: this.vault, tags }),
+            body: JSON.stringify({ tags }),
           }
         );
         this.selectedMemory = { ...this.selectedMemory, tags: resp.tags };
@@ -1029,14 +1047,13 @@ document.addEventListener('alpine:init', () => {
         return;
       }
       try {
-        await this.apiCall('/api/link', {
+        await this.apiCall('/api/link?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
             source_id: this.linkModal.sourceId,
             target_id: this.linkModal.targetId.trim(),
             rel_type: parseInt(this.linkModal.relType, 10),
             weight: parseFloat(this.linkModal.weight),
-            vault: this.vault,
           }),
         });
         this.closeLinkModal();
@@ -1102,13 +1119,16 @@ document.addEventListener('alpine:init', () => {
 
     // ── Graph ──────────────────────────────────────────────────────────────
     graphShowOrphans: false,
+    graphLimit: 50,
 
     async loadGraph() {
       this.addNotification('info', 'Loading graph…');
       try {
         // Use GET /api/engrams for node listing
+        const limit = Math.max(1, Math.min(200, parseInt(this.graphLimit, 10) || 50));
+        this.graphLimit = limit;
         const data = await this.apiCall(
-          '/api/engrams?vault=' + encodeURIComponent(this.vault) + '&limit=50&offset=0'
+          '/api/engrams?vault=' + encodeURIComponent(this.vault) + '&limit=' + limit + '&offset=0'
         );
         const engrams = data.engrams || [];
         if (!engrams.length) {
@@ -1118,11 +1138,10 @@ document.addEventListener('alpine:init', () => {
 
         // Load all engram links in a single batch call (replaces N+1 pattern).
         const nodeIdSet = new Set(engrams.map(e => e.id));
-        const batchResp = await this.apiCall('/api/engrams/links/batch', {
+        const batchResp = await this.apiCall('/api/engrams/links/batch?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
             ids: engrams.map(e => e.id),
-            vault: this.vault,
           }),
         });
         const linksMap = batchResp.links || {};
@@ -1158,18 +1177,22 @@ document.addEventListener('alpine:init', () => {
         const nodesToRender = filteredEngrams.length > 0 ? filteredEngrams : engrams;
 
         // Build node elements
-        const nodeElements = nodesToRender.map(e => ({
-          data: {
-            id: e.id,
-            label: e.concept || e.id.slice(0, 8),
-            size: connectedNodeIds.has(e.id) ? 20 + (e.confidence || 0.5) * 20 : 12,
-            color: !connectedNodeIds.has(e.id) ? '#64748b'
-                 : (e.confidence || 0) > 0.7 ? '#06b6d4'
-                 : (e.confidence || 0) > 0.4 ? '#a855f7' : '#eab308',
-            orphan: !connectedNodeIds.has(e.id),
-            snippet: (e.content || '').slice(0, 80),
-          },
-        }));
+        const nodeElements = nodesToRender.map(e => {
+          const fullLabel = e.concept || e.id.slice(0, 8);
+          return {
+            data: {
+              id: e.id,
+              label: fullLabel,
+              shortLabel: fullLabel.length > 20 ? fullLabel.slice(0, 18) + '…' : fullLabel,
+              size: connectedNodeIds.has(e.id) ? 20 + (e.confidence || 0.5) * 20 : 12,
+              color: !connectedNodeIds.has(e.id) ? '#64748b'
+                   : (e.confidence || 0) > 0.7 ? '#06b6d4'
+                   : (e.confidence || 0) > 0.4 ? '#a855f7' : '#eab308',
+              orphan: !connectedNodeIds.has(e.id),
+              snippet: (e.content || '').slice(0, 80),
+            },
+          };
+        });
 
         const elements = [...nodeElements, ...edges];
 
@@ -1217,13 +1240,47 @@ document.addEventListener('alpine:init', () => {
               style: { 'border-width': 3, 'border-color': '#06b6d4' },
             },
           ],
-          layout: { name: 'fcose', animate: true, animationDuration: 600 },
+          layout: {
+            name: 'fcose',
+            animate: true,
+            animationDuration: 600,
+            randomize: true,
+            padding: 40,
+            idealEdgeLength: 120,
+            nodeRepulsion: 6500,
+            edgeElasticity: 0.45,
+            gravity: 0.2,
+            numIter: 2500,
+            tile: true,
+            tilingPaddingVertical: 30,
+            tilingPaddingHorizontal: 30,
+          },
           wheelSensitivity: 0.3,
         });
 
-        // Fade edges in after nodes settle into position (fcose layout: 600ms).
-        // cy.one() fires once and removes itself — does not re-trigger on layout re-runs.
+        // Apply current label mode to the freshly initialised graph.
+        this._applyGraphLabelStyle();
+
+        // Resize Cytoscape when the container changes size (sidebar collapse,
+        // window resize, etc). Only resize() here — fit() is handled by layoutstop
+        // to avoid zooming in on pre-layout node positions.
+        if (this._cyResizeObserver) this._cyResizeObserver.disconnect();
+        const cyContainer = document.getElementById('cy');
+        if (cyContainer && typeof ResizeObserver !== 'undefined') {
+          let _cyResizeTimer = null;
+          this._cyResizeObserver = new ResizeObserver(() => {
+            clearTimeout(_cyResizeTimer);
+            _cyResizeTimer = setTimeout(() => {
+              if (this._cy) this._cy.resize();
+            }, 150);
+          });
+          this._cyResizeObserver.observe(cyContainer);
+        }
+
+        // Fade edges in and fit view after nodes settle (fcose layout: 600ms).
+        // cy.one() fires once and removes itself — does not re-trigger on re-runs.
         this._cy.one('layoutstop', () => {
+          this._cy.fit(undefined, 40);
           this._cy.edges().animate({
             style: { opacity: 0.6 },
             duration: 250,
@@ -1258,6 +1315,28 @@ document.addEventListener('alpine:init', () => {
     graphFit() {
       if (this._cy) { this._cy.fit(); }
     },
+    graphCycleLabel() {
+      const modes = ['full', 'short', 'none'];
+      const next = modes[(modes.indexOf(this.graphLabelMode) + 1) % modes.length];
+      this.graphLabelMode = next;
+      this._applyGraphLabelStyle();
+    },
+    _applyGraphLabelStyle() {
+      if (!this._cy) return;
+      const mode = this.graphLabelMode;
+      this._cy.nodes().forEach(node => {
+        const lbl = mode === 'full' ? node.data('label')
+                  : mode === 'short' ? node.data('shortLabel')
+                  : node.data('label');
+        node.style({
+          label: lbl,
+          'text-opacity': mode === 'none' ? 0 : 1,
+        });
+      });
+      this._cy.edges().forEach(edge => {
+        edge.style({ 'text-opacity': mode === 'none' ? 0 : 1 });
+      });
+    },
 
     // ── Entity Graph ───────────────────────────────────────────────────────
     async loadEntityGraph() {
@@ -1278,32 +1357,34 @@ document.addEventListener('alpine:init', () => {
         (data.nodes || []).forEach(n => {
           const entityType = (n.type || 'other').toLowerCase();
           nodeIdSet.add(n.id);
+          // Cytoscape requires { data: { id, ... } } element format.
           nodes.push({
-            id: n.id,
-            label: n.id,
-            type: entityType,
-            title: n.id + ' (' + entityType + ')',
-            shape: 'dot',
-            size: 16,
-            color: this.getEntityTypeColor(entityType),
-            font: { size: 11, color: '#e2e8f0' },
-            borderWidth: 2,
-            borderWidthSelected: 3,
-            borderColor: 'rgba(255,255,255,0.2)'
+            data: {
+              id: n.id,
+              label: n.id,
+              shortLabel: n.id.length > 20 ? n.id.slice(0, 18) + '…' : n.id,
+              type: entityType,
+              size: 16,
+              color: this.getEntityTypeColor(entityType),
+              borderWidth: 2,
+              borderWidthSelected: 3,
+              borderColor: 'rgba(255,255,255,0.2)',
+            },
           });
         });
 
         (data.edges || []).forEach(e => {
           if (nodeIdSet.has(e.from) && nodeIdSet.has(e.to)) {
+            // Cytoscape uses source/target (not from/to) and requires { data: { ... } }.
             edges.push({
-              from: e.from,
-              to: e.to,
-              label: e.rel_type,
-              arrows: 'to',
-              color: 'rgba(168,85,247,0.4)',
-              font: { size: 10, color: '#ccc' },
-              width: Math.max(1, (e.weight || 0.5) * 3),
-              smooth: { type: 'continuous' }
+              data: {
+                id: e.from + '-' + e.to + '-' + (e.rel_type || ''),
+                source: e.from,
+                target: e.to,
+                label: e.rel_type || '',
+                color: 'rgba(168,85,247,0.4)',
+                width: Math.max(1, (e.weight || 0.5) * 3),
+              },
             });
           }
         });
@@ -1316,7 +1397,6 @@ document.addEventListener('alpine:init', () => {
         // Reinit or destroy existing graph
         if (this._entityCy) { this._entityCy.destroy(); this._entityCy = null; }
 
-        // Create vis.Network-style data structure for Cytoscape
         const elements = nodes.concat(edges);
 
         this._entityCy = cytoscape({
@@ -1330,18 +1410,20 @@ document.addEventListener('alpine:init', () => {
                 'width': 'data(size)',
                 'height': 'data(size)',
                 'label': 'data(label)',
-                'color': 'data(font.color)',
-                'font-size': 'data(font.size)',
-                'text-valign': 'center',
+                'color': '#e2e8f0',
+                'font-size': '10px',
+                'text-valign': 'bottom',
                 'text-halign': 'center',
+                'text-margin-y': 6,
                 'border-width': 'data(borderWidth)',
                 'border-color': 'data(borderColor)',
-                'text-background': true,
-                'text-background-color': 'rgba(0,0,0,0.5)',
+                'text-background-opacity': 0.7,
+                'text-background-color': 'rgba(0,0,0,0.6)',
                 'text-background-padding': '2px',
                 'text-background-shape': 'roundrectangle',
-                'text-wrap': 'wrap',
-                'text-max-width': '80px'
+                'text-wrap': 'ellipsis',
+                'text-max-width': '100px',
+                'min-zoomed-font-size': 8
               }
             },
             {
@@ -1358,10 +1440,13 @@ document.addEventListener('alpine:init', () => {
                 'width': 'data(width)',
                 'curve-style': 'bezier',
                 'opacity': 0.7,
+                'target-arrow-shape': 'triangle',
+                'target-arrow-color': 'data(color)',
+                'arrow-scale': 0.8,
                 'label': 'data(label)',
-                'color': 'data(font.color)',
-                'font-size': 'data(font.size)',
-                'text-background': true,
+                'color': '#ccc',
+                'font-size': '10px',
+                'text-background-opacity': 0.6,
                 'text-background-color': 'rgba(0,0,0,0.5)',
                 'text-background-padding': '2px',
                 'text-background-shape': 'roundrectangle'
@@ -1372,7 +1457,19 @@ document.addEventListener('alpine:init', () => {
             name: 'fcose',
             animate: true,
             animationDuration: 600,
-            animationEasing: 'ease-out'
+            animationEasing: 'ease-out',
+            randomize: true,
+            padding: 60,
+            idealEdgeLength: 250,
+            nodeRepulsion: 50000,
+            edgeElasticity: 0.1,
+            gravity: 0.02,
+            gravityRange: 1.5,
+            numIter: 5000,
+            tile: true,
+            tilingPaddingVertical: 60,
+            tilingPaddingHorizontal: 60,
+            nodeSeparation: 200
           },
           wheelSensitivity: 0.3
         });
@@ -1384,6 +1481,7 @@ document.addEventListener('alpine:init', () => {
         });
 
         this.entityGraphLoaded = true;
+        this._applyEntityGraphLabelStyle();
         this.entityGraphStatus = 'Loaded ' + nodes.length + ' entities, ' + edges.length + ' relationships';
         this.addNotification('success', this.entityGraphStatus);
       } catch (err) {
@@ -1422,6 +1520,28 @@ document.addEventListener('alpine:init', () => {
 
     entityGraphFit() {
       if (this._entityCy) { this._entityCy.fit(); }
+    },
+    entityGraphCycleLabel() {
+      const modes = ['full', 'short', 'none'];
+      const next = modes[(modes.indexOf(this.entityGraphLabelMode) + 1) % modes.length];
+      this.entityGraphLabelMode = next;
+      this._applyEntityGraphLabelStyle();
+    },
+    _applyEntityGraphLabelStyle() {
+      if (!this._entityCy) return;
+      const mode = this.entityGraphLabelMode;
+      this._entityCy.nodes().forEach(node => {
+        const lbl = mode === 'full' ? node.data('label')
+                  : mode === 'short' ? node.data('shortLabel')
+                  : node.data('label');
+        node.style({
+          label: lbl,
+          'text-opacity': mode === 'none' ? 0 : 1,
+        });
+      });
+      this._entityCy.edges().forEach(edge => {
+        edge.style({ 'text-opacity': mode === 'none' ? 0 : 1 });
+      });
     },
 
     // ── Session ────────────────────────────────────────────────────────────
@@ -1471,11 +1591,20 @@ document.addEventListener('alpine:init', () => {
     // ── Settings ───────────────────────────────────────────────────────────
     async loadEmbedStatus() {
       try {
-        this.embedStatus = await this.apiCall('/api/admin/embed/status');
+        const data = await this.apiCall('/api/admin/embed/status');
+        this.embedStatus = data;
         // Reflect the active provider in the plugin config UI (local is default, not a plugin choice)
-        const p = this.embedStatus?.provider;
+        const p = data?.provider;
         if (p && p !== 'none' && p !== 'local') {
           this.pluginCfg.embedProvider = p;
+        }
+        this.pluginCfg.embedRatePerSec = data.rate_per_sec ?? 0;
+        this.pluginCfg.embedETASecs    = data.eta_seconds ?? 0;
+        // hardware_accelerated is absent for cloud providers; present (true/false) for Ollama
+        if (Object.prototype.hasOwnProperty.call(data, 'hardware_accelerated')) {
+          this.pluginCfg.embedHardwareGPU = data.hardware_accelerated;
+        } else {
+          this.pluginCfg.embedHardwareGPU = null;
         }
       } catch (_) {
         // Non-fatal: embedStatus stays null, UI shows fallback
@@ -1541,14 +1670,19 @@ document.addEventListener('alpine:init', () => {
     async loadSavedPluginConfig() {
         try {
             const data = await this.apiCall('/api/admin/plugin-config');
-            const embedUrl = data.embed_url || '';
-            // Only populate the Base URL field when it's an HTTP/HTTPS URL.
-            // ollama:// and other scheme URLs encode a model name, not a base URL.
-            if (embedUrl.startsWith('http://') || embedUrl.startsWith('https://')) {
-                this.pluginCfg.embedUrl = embedUrl;
-            }
-        } catch (_) {
-            // Non-critical — leave embedUrl at default
+            const parsed = MuninnPluginCfg.parsePluginConfigResponse(data);
+            if (!parsed) return;
+            const c = this.pluginCfg;
+            c.embedProvider  = parsed.embedProvider;
+            if (parsed.embedOllamaModel  !== null) c.embedOllamaModel  = parsed.embedOllamaModel;
+            if (parsed.embedUrl          !== null) c.embedUrl          = parsed.embedUrl;
+            if (parsed.embedApiKey       !== null) c.embedApiKey       = parsed.embedApiKey;
+            c.enrichProvider = parsed.enrichProvider;
+            if (parsed.enrichOllamaModel !== null) c.enrichOllamaModel = parsed.enrichOllamaModel;
+            if (parsed.enrichModel       !== null) c.enrichModel       = parsed.enrichModel;
+            if (parsed.enrichApiKey      !== null) c.enrichApiKey      = parsed.enrichApiKey;
+        } catch (e) {
+            console.warn('loadSavedPluginConfig failed:', e);
         }
     },
     async loadWorkers() {
@@ -1779,6 +1913,31 @@ document.addEventListener('alpine:init', () => {
       return Math.min(100, Math.round((embedded / total) * 100));
     },
 
+    // Returns a formatted rate string like "0.7s/embedding", or '' when idle.
+    embedSecsPerItem() {
+      if (this.pluginCfg.embedRatePerSec > 0) {
+        return (1 / this.pluginCfg.embedRatePerSec).toFixed(1) + 's/embedding';
+      }
+      return '';
+    },
+
+    // Returns a human-readable ETA string like "~3 min", or '' when idle.
+    embedETADisplay() {
+      const secs = this.pluginCfg.embedETASecs;
+      if (secs <= 0) return '';
+      if (secs < 60) return '< 1 min';
+      const mins = Math.round(secs / 60);
+      if (mins < 60) return '~' + mins + ' min';
+      const hrs = Math.floor(mins / 60);
+      const rem = mins % 60;
+      return rem > 0 ? '~' + hrs + ' hr ' + rem + ' min' : '~' + hrs + ' hr';
+    },
+
+    // True only when Ollama is the embed provider and hardware_accelerated is explicitly false.
+    get embedIsCPU() {
+      return this.pluginCfg.embedHardwareGPU === false;
+    },
+
     // ── Cluster ────────────────────────────────────────────────────────────
     async loadClusterDashboard() {
       // Clear any existing intervals and SSE feed before setting up new ones
@@ -1812,7 +1971,9 @@ document.addEventListener('alpine:init', () => {
         try {
           const secResp = await fetch('/api/admin/cluster/token', { credentials: 'same-origin' });
           if (secResp.ok) this.clusterSecurityPosture = await secResp.json();
-        } catch (_) {}
+        } catch (err) {
+          console.warn('[muninn] cluster security posture fetch failed:', err);
+        }
         await Promise.all([
           this._loadClusterNodes(),
           this._loadClusterHealth(),
@@ -1845,19 +2006,25 @@ document.addEventListener('alpine:init', () => {
         if (prevEpoch !== null && newEpoch !== prevEpoch && newEpoch > 0) {
           this._recordFailoverEvent(newEpoch, health);
         }
-      } catch (_) {}
+      } catch (err) {
+        console.warn('[muninn] cluster nodes fetch failed:', err);
+      }
     },
 
     async _loadClusterHealth() {
       try {
         this.clusterHealth = await this.apiCall('/v1/cluster/health');
-      } catch (_) {}
+      } catch (err) {
+        console.warn('[muninn] cluster health fetch failed:', err);
+      }
     },
 
     async _loadClusterCCS() {
       try {
         this.clusterCCS = await this.apiCall('/v1/cluster/cognitive/consistency');
-      } catch (_) {}
+      } catch (err) {
+        console.warn('[muninn] cluster CCS fetch failed:', err);
+      }
     },
 
     _nodeStatus(node, health) {
@@ -2025,7 +2192,9 @@ document.addEventListener('alpine:init', () => {
           const data = JSON.parse(e.data);
           this.clusterFeed.unshift({ ...data, ts: new Date().toLocaleTimeString() });
           if (this.clusterFeed.length > 200) this.clusterFeed.pop();
-        } catch (_) {}
+        } catch (err) {
+          console.warn('[muninn] cluster feed parse error:', err, e.data);
+        }
       });
       this._clusterFeedSSE = es;
     },
@@ -2042,8 +2211,9 @@ document.addEventListener('alpine:init', () => {
       try {
         const resp = await fetch('/api/admin/cluster/token', { credentials: 'same-origin' });
         if (resp.ok) this.clusterToken = await resp.json();
-      } catch (_) {}
-      finally { this.clusterTokenLoading = false; }
+      } catch (err) {
+        console.warn('[muninn] cluster token load failed:', err);
+      } finally { this.clusterTokenLoading = false; }
     },
 
     async regenerateToken() {
@@ -2054,7 +2224,9 @@ document.addEventListener('alpine:init', () => {
           credentials: 'same-origin',
         });
         if (resp.ok) this.clusterToken = await resp.json();
-      } catch (_) {}
+      } catch (err) {
+        this.addNotification('error', 'Token regeneration failed: ' + err.message);
+      }
     },
 
     copyToken() {
@@ -2062,6 +2234,23 @@ document.addEventListener('alpine:init', () => {
       navigator.clipboard.writeText(this.clusterToken.token).catch(() => {});
       this.clusterTokenCopied = true;
       setTimeout(() => { this.clusterTokenCopied = false; }, 2000);
+    },
+
+    async loadClusterSettings() {
+      try {
+        const resp = await fetch('/api/admin/cluster/settings', { credentials: 'same-origin' });
+        if (resp.ok) {
+          const data = await resp.json();
+          this.clusterSettings = {
+            heartbeat_ms: data.heartbeat_ms ?? this.clusterSettings.heartbeat_ms,
+            sdown_beats: data.sdown_beats ?? this.clusterSettings.sdown_beats,
+            ccs_interval_seconds: data.ccs_interval_seconds ?? this.clusterSettings.ccs_interval_seconds,
+            reconcile_on_heal: data.reconcile_on_heal ?? this.clusterSettings.reconcile_on_heal,
+          };
+        }
+      } catch (err) {
+        // Non-fatal — form shows defaults; user can still save.
+      }
     },
 
     async saveClusterSettings() {
@@ -2078,8 +2267,9 @@ document.addEventListener('alpine:init', () => {
           this.clusterSettingsSaved = true;
           setTimeout(() => { this.clusterSettingsSaved = false; }, 2500);
         }
-      } catch (_) {}
-      finally { this.clusterSettingsSaving = false; }
+      } catch (err) {
+        this.addNotification('error', 'Failed to save cluster settings: ' + err.message);
+      } finally { this.clusterSettingsSaving = false; }
     },
 
     async rotateTLS() {
@@ -2148,9 +2338,7 @@ document.addEventListener('alpine:init', () => {
     // ── Plugin config save ───────────────────────────────────────────────────
     async savePluginConfig(section) {
       const c = this.pluginCfg;
-      const savedKey = section + 'Saved';
       const errorKey = section + 'Error';
-      c[savedKey] = false;
       c[errorKey] = '';
 
       // Build payload from current pluginCfg state.
@@ -2169,8 +2357,9 @@ document.addEventListener('alpine:init', () => {
 
       try {
         await this.apiCall('/api/admin/plugin-config', { method: 'PUT', body: JSON.stringify(payload) });
-        c[savedKey] = true;
-        setTimeout(() => { c[savedKey] = false; }, 4000);
+        this.addNotification('success', section === 'embed'
+          ? 'Embedding provider saved — restart MuninnDB to apply.'
+          : 'Enrichment provider saved — restart MuninnDB to apply.');
         if (section === 'embed') c.embedShowForm = false;
         if (section === 'enrich') c.enrichShowForm = false;
       } catch (e) {
@@ -2459,15 +2648,10 @@ document.addEventListener('alpine:init', () => {
     // ── Lifecycle state ────────────────────────────────────────────────────
     async updateLifecycleState(id, state) {
       try {
-        const res = await fetch('/api/engrams/' + encodeURIComponent(id) + '/state', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vault: this.vault, state }),
-        });
-        if (!res.ok) {
-          const text = await res.text().catch(() => res.statusText);
-          throw new Error(res.status + ': ' + text);
-        }
+        const res = await this.apiCall(
+          '/api/engrams/' + encodeURIComponent(id) + '/state?vault=' + encodeURIComponent(this.vault),
+          { method: 'PUT', body: JSON.stringify({ state }) }
+        );
         if (this.selectedMemory && this.selectedMemory.id === id) {
           this.selectedMemory = { ...this.selectedMemory, state };
         }
@@ -2514,10 +2698,9 @@ document.addEventListener('alpine:init', () => {
       if (!this.searchQuery.trim()) return;
       this.explainModal = { show: true, data: null, loading: true };
       try {
-        const data = await this.apiCall('/api/explain', {
+        const data = await this.apiCall('/api/explain?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
-            vault: this.vault,
             engram_id: engramId,
             query: [this.searchQuery.trim()],
           }),
@@ -2567,10 +2750,9 @@ document.addEventListener('alpine:init', () => {
         return;
       }
       try {
-        const data = await this.apiCall('/api/consolidate', {
+        const data = await this.apiCall('/api/consolidate?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
-            vault: this.vault,
             ids: this.selectedMemoryIds,
             merged_content: this.consolidateModal.mergedContent.trim(),
           }),
@@ -2607,10 +2789,9 @@ document.addEventListener('alpine:init', () => {
         .map(s => s.trim())
         .filter(Boolean);
       try {
-        const data = await this.apiCall('/api/decide', {
+        const data = await this.apiCall('/api/decide?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
-            vault: this.vault,
             decision: this.decideModal.decision.trim(),
             rationale: this.decideModal.rationale.trim(),
             alternatives,

@@ -2,17 +2,27 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/plugin"
+	"github.com/scrypster/muninndb/internal/plugin/enrich"
 	"github.com/scrypster/muninndb/internal/storage"
 )
+
+// maxReplayFails is the number of consecutive enrichment failures after which
+// an engram is silently skipped by ReplayEnrichment for the remainder of the
+// server session. Prevents a broken engram from blocking every replay call.
+const maxReplayFails = 3
 
 // ReplayEnrichmentResult holds the outcome of a replay enrichment run.
 type ReplayEnrichmentResult struct {
 	Processed int
 	Skipped   int
+	Failed    int
+	Remaining int
 	StagesRun []string
 	DryRun    bool
 }
@@ -78,6 +88,8 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 		return &ReplayEnrichmentResult{
 			Processed: 0,
 			Skipped:   0,
+			Failed:    0,
+			Remaining: 0,
 			StagesRun: validStages,
 			DryRun:    dryRun,
 		}, nil
@@ -95,6 +107,7 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 		skipped := 0
 		for _, eng := range engrams {
 			if eng == nil {
+				skipped++
 				continue
 			}
 			// "not found" means no flags set yet — treat as 0.
@@ -108,6 +121,8 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 		return &ReplayEnrichmentResult{
 			Processed: needed,
 			Skipped:   skipped,
+			Failed:    0,
+			Remaining: 0,
 			StagesRun: validStages,
 			DryRun:    true,
 		}, nil
@@ -120,10 +135,24 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 
 	processed := 0
 	skipped := 0
+	failed := 0
 
-	for _, eng := range engrams {
+	for i, eng := range engrams {
 		if eng == nil {
+			skipped++
 			continue
+		}
+
+		// Honour context cancellation (deadline, manual cancel) — report remaining work.
+		if ctx.Err() != nil {
+			return &ReplayEnrichmentResult{
+				Processed: processed,
+				Skipped:   skipped,
+				Failed:    failed,
+				Remaining: countNonNilEngrams(engrams[i:]),
+				StagesRun: validStages,
+				DryRun:    false,
+			}, nil
 		}
 
 		// Check which stages are already done.
@@ -136,19 +165,53 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 			continue
 		}
 
-		// Run enrichment for this engram.
-		// plugin.Engram is an alias for storage.Engram, so eng is passed directly.
-		result, enrichErr := e.enrichPlugin.Enrich(ctx, eng)
-		if enrichErr != nil {
-			slog.Warn("replay enrichment: enrich failed, skipping",
-				"id", eng.ID.String(), "err", enrichErr)
+		// Skip engrams that have failed too many times this session.
+		e.replayFailMu.Lock()
+		failCount := e.replayFailCounts[eng.ID]
+		e.replayFailMu.Unlock()
+		if failCount >= maxReplayFails {
+			slog.Debug("replay enrichment: skipping persistently failing engram",
+				"id", eng.ID.String(), "fails", failCount)
+			skipped++
 			continue
 		}
 
-		// Persist enrichment results (summary, key_points, memory_type).
-		if updateErr := e.store.UpdateDigest(ctx, eng.ID, result.Summary, result.KeyPoints, result.MemoryType); updateErr != nil {
+		// Run enrichment for this engram, optionally with a per-engram timeout.
+		enrichCtx := ctx
+		var enrichCancel context.CancelFunc
+		if e.replayEnrichTimeout > 0 {
+			enrichCtx, enrichCancel = context.WithTimeout(ctx, e.replayEnrichTimeout)
+		}
+		result, enrichErr := e.enrichPlugin.Enrich(enrichCtx, eng)
+		if enrichCancel != nil {
+			enrichCancel()
+		}
+		if enrichErr != nil {
+			if errors.Is(enrichErr, enrich.ErrNothingToEnrich) {
+				slog.Debug("replay enrichment: nothing to enrich, skipping", "id", eng.ID.String())
+				skipped++
+				continue
+			}
+			// Track consecutive failures; skip if threshold reached next time.
+			e.replayFailMu.Lock()
+			e.replayFailCounts[eng.ID]++
+			newCount := e.replayFailCounts[eng.ID]
+			e.replayFailMu.Unlock()
+			slog.Warn("replay enrichment: enrich failed, skipping",
+				"id", eng.ID.String(), "err", enrichErr, "fail_count", newCount)
+			failed++
+			continue
+		}
+		// Success — clear any prior failure count.
+		e.replayFailMu.Lock()
+		delete(e.replayFailCounts, eng.ID)
+		e.replayFailMu.Unlock()
+
+		// Persist enrichment results (summary, key_points, memory_type, type_label).
+		if updateErr := e.store.UpdateDigest(ctx, eng.ID, result.Summary, result.KeyPoints, result.MemoryType, result.TypeLabel); updateErr != nil {
 			slog.Warn("replay enrichment: UpdateDigest failed",
 				"id", eng.ID.String(), "err", updateErr)
+			failed++
 			continue
 		}
 
@@ -231,13 +294,41 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 	return &ReplayEnrichmentResult{
 		Processed: processed,
 		Skipped:   skipped,
+		Failed:    failed,
 		StagesRun: validStages,
 		DryRun:    false,
 	}, nil
+}
+
+// countNonNilEngrams returns the number of non-nil entries in a slice of engram pointers.
+func countNonNilEngrams(engrams []*storage.Engram) int {
+	n := 0
+	for _, eng := range engrams {
+		if eng != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // SetEnrichPlugin registers an EnrichPlugin for use by ReplayEnrichment.
 // Must be called before ReplayEnrichment is used (not concurrency-safe after start).
 func (e *Engine) SetEnrichPlugin(p plugin.EnrichPlugin) {
 	e.enrichPlugin = p
+}
+
+// SetReplayEnrichTimeout sets a per-engram timeout applied to each Enrich() call
+// inside ReplayEnrichment. A value of 0 (default) disables the extra timeout and
+// lets the MCP request context govern the full run.
+// Useful when the LLM backend (e.g. Ollama) can hang on cold-start.
+func (e *Engine) SetReplayEnrichTimeout(d time.Duration) {
+	e.replayEnrichTimeout = d
+}
+
+// ResetReplayFailCount clears the in-session failure counter for the given engram,
+// allowing ReplayEnrichment to attempt it again after a manual reset.
+func (e *Engine) ResetReplayFailCount(id storage.ULID) {
+	e.replayFailMu.Lock()
+	delete(e.replayFailCounts, id)
+	e.replayFailMu.Unlock()
 }

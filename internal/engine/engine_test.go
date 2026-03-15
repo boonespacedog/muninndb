@@ -39,7 +39,7 @@ func testEnv(t *testing.T) (*Engine, func()) {
 	embedder := &noopEmbedder{}
 	actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 
 	return eng, func() {
 		eng.Stop()    // stop FTS worker, novelty worker, coherence flush, autoAssoc
@@ -69,7 +69,7 @@ func testEnvWithDB(t *testing.T) (*Engine, *pebble.DB, func()) {
 	embedder := &noopEmbedder{}
 	actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 
 	return eng, db, func() {
 		eng.Stop()
@@ -136,6 +136,20 @@ func (a *ftsTrigAdapter) Search(ctx context.Context, ws [8]byte, query string, t
 		out[i] = trigger.ScoredID{ID: storage.ULID(r.ID), Score: r.Score}
 	}
 	return out, nil
+}
+
+// awaitFTS drains the FTS worker by stopping it (which deterministically
+// processes all queued index jobs) and restarting it with a fresh worker.
+// This is the correct alternative to time.Sleep(300ms) when a test needs
+// to ensure FTS visibility before calling Activate.
+// The restarted worker will be stopped by eng.Stop() during cleanup.
+func awaitFTS(t *testing.T, eng *Engine) {
+	t.Helper()
+	if eng.ftsWorker == nil {
+		return
+	}
+	eng.ftsWorker.Stop()
+	eng.ftsWorker = fts.NewWorker(eng.fts)
 }
 
 // TestHelloVersionCheck ensures the engine accepts the protocol version string
@@ -249,7 +263,7 @@ func TestActivateReturnsResults(t *testing.T) {
 	}
 
 	// Allow async FTS worker to index the written engrams (worker flushes every 100ms).
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	// Activate with a query that should match the Go engram
 	resp, err := eng.Activate(ctx, &mbp.ActivateRequest{
@@ -299,7 +313,7 @@ func TestActivateFTSRankingCorrect(t *testing.T) {
 	}
 
 	// Allow async FTS worker to index the written engrams.
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	tests := []struct {
 		query   string
@@ -446,7 +460,7 @@ func TestActivateConfidenceAffectsScore(t *testing.T) {
 	}
 
 	// Allow async FTS worker to index (same as TestActivateReturnsResults).
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	resp, err := eng.Activate(ctx, &mbp.ActivateRequest{
 		Vault:      "test",
@@ -496,7 +510,7 @@ func TestEngineWorkersSubmit(t *testing.T) {
 	actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
 
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()    // stop FTS worker and other background goroutines before closing db
 		store.Close() // stop PebbleStore background workers and close db
@@ -515,7 +529,7 @@ func TestEngineWorkersSubmit(t *testing.T) {
 	}
 
 	// Allow async FTS worker to index (same as TestActivateReturnsResults).
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	// Activate (which should trigger worker submissions if workers were wired)
 	resp, err := eng.Activate(ctx, &mbp.ActivateRequest{
@@ -585,17 +599,17 @@ func TestEngineConsolidate(t *testing.T) {
 	r1, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "a", Content: "content a"})
 	r2, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "b", Content: "content b"})
 
-	newID, archived, warnings, err := eng.Consolidate(ctx, "test", []string{r1.ID, r2.ID}, "merged content")
+	res, err := eng.Consolidate(ctx, "test", []string{r1.ID, r2.ID}, "merged content")
 	if err != nil {
 		t.Fatalf("Consolidate: %v", err)
 	}
-	if newID == (storage.ULID{}) {
+	if res.MergedID == (storage.ULID{}) {
 		t.Fatal("Consolidate returned zero merged ID")
 	}
-	if len(archived) == 0 {
+	if len(res.Archived) == 0 {
 		t.Fatal("expected at least 1 archived ID")
 	}
-	_ = warnings
+	_ = res.Warnings
 }
 
 func TestEngineSession(t *testing.T) {
@@ -622,12 +636,12 @@ func TestEngineDecide(t *testing.T) {
 
 	r, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "evidence", Content: "supporting data"})
 
-	newID, err := eng.Decide(ctx, "test", "go with option A",
+	res, err := eng.Decide(ctx, "test", "go with option A",
 		"rationale text", []string{"option B", "option C"}, []string{r.ID})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
-	if newID == (storage.ULID{}) {
+	if res.ID == (storage.ULID{}) {
 		t.Fatal("Decide returned zero ID")
 	}
 }
@@ -972,7 +986,7 @@ func TestActivateObserveModeDoesNotError(t *testing.T) {
 	}
 
 	// Allow async FTS worker to index (same as TestActivateReturnsResults).
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	// Normal activate (not observe mode) — baseline.
 	resp, err := eng.Activate(ctx, &mbp.ActivateRequest{
@@ -1107,7 +1121,7 @@ func TestActivate_PlasticityGatesHebbian(t *testing.T) {
 		t.Fatalf("SetVaultConfig: %v", err)
 	}
 
-	eng := NewEngine(store, as, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, AuthStore: as, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -1139,7 +1153,7 @@ func TestActivate_PlasticityGatesHebbian(t *testing.T) {
 	}
 
 	// Also verify that nil authStore (default test path) gives no panic.
-	eng2 := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng2 := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng2.Stop()
 	}()
@@ -1203,7 +1217,7 @@ func TestEngine_LobeMode_CollectsEffects(t *testing.T) {
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
 
 	// nil workers — simulates Lobe mode
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -1225,7 +1239,7 @@ func TestEngine_LobeMode_CollectsEffects(t *testing.T) {
 	}
 
 	// Allow FTS worker to index
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	resp, err := eng.Activate(ctx, &mbp.ActivateRequest{
 		Vault:      "test",
@@ -1308,7 +1322,7 @@ func TestEngine_CortexMode_NoForwarding(t *testing.T) {
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
 
 	// nil workers — but we do NOT wire a coordinator
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -1329,7 +1343,7 @@ func TestEngine_CortexMode_NoForwarding(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	_, err = eng.Activate(ctx, &mbp.ActivateRequest{
 		Vault:      "test",
@@ -1552,7 +1566,7 @@ func TestActivate_CancelledContext_PreventsProvenanceGoroutines(t *testing.T) {
 	}
 
 	// Allow the async FTS worker to index the written engrams.
-	time.Sleep(300 * time.Millisecond)
+	awaitFTS(t, eng)
 
 	// Sanity check: normal activate returns results, establishing a baseline.
 	normalResp, err := eng.Activate(ctx, &mbp.ActivateRequest{
@@ -1648,7 +1662,7 @@ func TestEngineRead_AfterRestart(t *testing.T) {
 		embedder := &noopEmbedder{}
 		actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 		trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
-		eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+		eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 		return eng, func() {
 			eng.Stop()
 			store.Close()
@@ -1903,7 +1917,7 @@ func TestActivateCore_VaultDefaultRecallMode(t *testing.T) {
 		t.Fatalf("SetVaultConfig: %v", err)
 	}
 
-	eng := NewEngine(store, as, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, AuthStore: as, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -2065,5 +2079,36 @@ func TestStat_DefaultVaultMinimum(t *testing.T) {
 	}
 	if resp.VaultCount < 1 {
 		t.Errorf("expected VaultCount >= 1 (minimum floor), got %d", resp.VaultCount)
+	}
+}
+
+// TestEngineTraverse_EdgeRelTypePopulated verifies that TraversalEdge.RelType
+// is populated from the storage.Association when traversing a typed edge.
+// Regression test for issue #173 (rel_type always empty in muninn_traverse).
+func TestEngineTraverse_EdgeRelTypePopulated(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	r1, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "src", Content: "source engram"})
+	r2, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "dst", Content: "destination engram"})
+
+	_, _ = eng.Link(ctx, &mbp.LinkRequest{
+		SourceID: r1.ID,
+		TargetID: r2.ID,
+		RelType:  uint16(storage.RelSupports),
+		Weight:   0.9,
+		Vault:    "test",
+	})
+
+	_, edges, err := eng.Traverse(ctx, "test", r1.ID, 1, 50, false)
+	if err != nil {
+		t.Fatalf("Traverse: %v", err)
+	}
+	if len(edges) == 0 {
+		t.Fatal("expected at least one edge")
+	}
+	if edges[0].RelType != storage.RelSupports {
+		t.Errorf("edge RelType = %v (%d), want storage.RelSupports (%d)", edges[0].RelType, edges[0].RelType, storage.RelSupports)
 	}
 }

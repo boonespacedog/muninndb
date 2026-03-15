@@ -172,7 +172,7 @@ class MuninnClient:
         if relationships is not None:
             body["relationships"] = relationships
 
-        response = await self._request("POST", "/api/engrams", json=body)
+        response = await self._request("POST", "/api/engrams", json=body, params={"vault": vault})
         return WriteResponse(
             id=response.get("id", ""),
             created_at=response.get("created_at", 0),
@@ -213,13 +213,13 @@ class MuninnClient:
             items.append(item)
 
         response = await self._request(
-            "POST", "/api/engrams/batch", json={"engrams": items}
+            "POST", "/api/engrams/batch", json={"engrams": items}, params={"vault": vault}
         )
 
         results = [
             BatchWriteResult(
                 index=r.get("index", i),
-                id=r.get("id", ""),
+                id=r.get("id"),
                 status=r.get("status", "error"),
                 error=r.get("error"),
             )
@@ -267,7 +267,7 @@ class MuninnClient:
             "brief_mode": brief_mode,
         }
 
-        response = await self._request("POST", "/api/activate", json=body)
+        response = await self._request("POST", "/api/activate", json=body, params={"vault": vault})
 
         activations = [
             ActivationItem(
@@ -334,6 +334,7 @@ class MuninnClient:
             created_at=response.get("created_at", 0),
             updated_at=response.get("updated_at", 0),
             last_access=response.get("last_access"),
+            coherence=coherence,
         )
 
     async def forget(self, id: str, vault: str = "default", hard: bool = False) -> bool:
@@ -395,7 +396,7 @@ class MuninnClient:
             "rel_type": rel_type,
             "weight": weight,
         }
-        await self._request("POST", "/api/link", json=body)
+        await self._request("POST", "/api/link", json=body, params={"vault": vault})
         return True
 
     async def stats(self, vault: str = "default") -> StatResponse:
@@ -434,7 +435,7 @@ class MuninnClient:
         self,
         vault: str = "default",
         push_on_write: bool = True,
-        threshold: float = 0.0,
+        threshold: float | None = None,
     ) -> SSEStream:
         """Subscribe to vault events via Server-Sent Events (SSE).
 
@@ -451,7 +452,7 @@ class MuninnClient:
         Args:
             vault: Vault to subscribe to (default: "default")
             push_on_write: Emit push events on new writes (default: True)
-            threshold: Min activation threshold for push events (default: 0.0)
+            threshold: Min activation threshold for push events. None means use server default.
 
         Returns:
             SSEStream async iterable
@@ -463,7 +464,7 @@ class MuninnClient:
             "vault": vault,
             "push_on_write": str(push_on_write).lower(),
         }
-        if threshold:
+        if threshold is not None:
             params["threshold"] = str(threshold)
 
         return SSEStream(self, "/api/subscribe", params)
@@ -487,7 +488,7 @@ class MuninnClient:
             EvolveResponse with the new engram ID
         """
         body = {"new_content": new_content, "reason": reason, "vault": vault}
-        response = await self._request("POST", f"/api/engrams/{id}/evolve", json=body)
+        response = await self._request("POST", f"/api/engrams/{id}/evolve", json=body, params={"vault": vault})
         return EvolveResponse(id=response.get("id", ""))
 
     async def consolidate(
@@ -507,7 +508,7 @@ class MuninnClient:
             ConsolidateResponse with new ID, archived IDs, and any warnings
         """
         body = {"vault": vault, "ids": ids, "merged_content": merged_content}
-        response = await self._request("POST", "/api/consolidate", json=body)
+        response = await self._request("POST", "/api/consolidate", json=body, params={"vault": vault})
         return ConsolidateResponse(
             id=response.get("id", ""),
             archived=response.get("archived", []),
@@ -539,7 +540,7 @@ class MuninnClient:
             body["alternatives"] = alternatives
         if evidence_ids:
             body["evidence_ids"] = evidence_ids
-        response = await self._request("POST", "/api/decide", json=body)
+        response = await self._request("POST", "/api/decide", json=body, params={"vault": vault})
         return DecideResponse(id=response.get("id", ""))
 
     async def restore(self, id: str, vault: str = "default") -> RestoreResponse:
@@ -568,6 +569,7 @@ class MuninnClient:
         max_hops: int = 2,
         max_nodes: int = 20,
         rel_types: list[str] | None = None,
+        follow_entities: bool = False,
         vault: str = "default",
     ) -> TraverseResponse:
         """Traverse the association graph from a starting engram.
@@ -577,6 +579,7 @@ class MuninnClient:
             max_hops: Maximum hops to traverse (default: 2)
             max_nodes: Maximum nodes to return (default: 20)
             rel_types: Filter by relationship types
+            follow_entities: Follow entity-level associations in addition to engram-level (default: False)
             vault: Vault name (default: "default")
 
         Returns:
@@ -590,7 +593,9 @@ class MuninnClient:
         }
         if rel_types:
             body["rel_types"] = rel_types
-        response = await self._request("POST", "/api/traverse", json=body)
+        if follow_entities:
+            body["follow_entities"] = True
+        response = await self._request("POST", "/api/traverse", json=body, params={"vault": vault})
         nodes = [
             TraversalNode(
                 id=n.get("id", ""),
@@ -633,7 +638,7 @@ class MuninnClient:
             ExplainResponse with scoring breakdown
         """
         body = {"vault": vault, "engram_id": engram_id, "query": query}
-        response = await self._request("POST", "/api/explain", json=body)
+        response = await self._request("POST", "/api/explain", json=body, params={"vault": vault})
         comp = response.get("components", {})
         return ExplainResponse(
             engram_id=response.get("engram_id", ""),
@@ -674,7 +679,7 @@ class MuninnClient:
         body: dict = {"state": state, "vault": vault}
         if reason:
             body["reason"] = reason
-        response = await self._request("PUT", f"/api/engrams/{id}/state", json=body)
+        response = await self._request("PUT", f"/api/engrams/{id}/state", json=body, params={"vault": vault})
         return SetStateResponse(
             id=response.get("id", ""),
             state=response.get("state", ""),
